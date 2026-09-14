@@ -1,0 +1,745 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta name="google-site-verification" content="Ga_dWI_w9nHPonq8KxSuoFS2rRLZzsFIt8kWPKGtPr4" />
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chess Game with Smart AI</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        .container {
+            background: white;
+            border-radius: 15px;
+            padding: 30px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.2);
+            max-width: 700px;
+            width: 100%;
+            animation: fadeIn 0.5s ease-in;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        h1 {
+            text-align: center;
+            color: #333;
+            margin-bottom: 30px;
+            font-size: 2.5rem;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.1);
+        }
+
+        .game-info {
+            text-align: center;
+            margin-bottom: 20px;
+            padding: 15px;
+            background: linear-gradient(135deg, #f0f0f0 0%, #e8e8e8 100%);
+            border-radius: 10px;
+            display: flex;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            box-shadow: inset 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        .info-section {
+            margin: 5px;
+            padding: 8px 15px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            font-weight: bold;
+            color: #333;
+        }
+
+        .game-mode {
+            text-align: center;
+            margin: 15px 0;
+            padding: 15px;
+            background: rgba(255,255,255,0.9);
+            border-radius: 10px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+
+        .game-mode label {
+            font-weight: bold;
+            margin-right: 10px;
+            color: #333;
+        }
+
+        .game-mode select {
+            padding: 8px 15px;
+            font-size: 14px;
+            border-radius: 8px;
+            border: 2px solid #667eea;
+            background: white;
+            color: #333;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-weight: bold;
+        }
+
+        .game-mode select:hover {
+            border-color: #5a6fd8;
+            box-shadow: 0 2px 8px rgba(102, 126, 234, 0.3);
+        }
+
+        .game-mode select:focus {
+            outline: none;
+            border-color: #4f5cd1;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.2);
+        }
+
+        #chessboard {
+            width: 480px;
+            height: 480px;
+            margin: 20px auto;
+            border: 4px solid #333;
+            border-radius: 10px;
+            position: relative;
+            box-shadow: 0 10px 20px rgba(0,0,0,0.4);
+            overflow: hidden;
+        }
+
+        .square {
+            width: 60px;
+            height: 60px;
+            float: left;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 36px;
+            cursor: pointer;
+            user-select: none;
+            transition: all 0.2s ease;
+            position: relative;
+            font-weight: bold;
+        }
+
+        .light { 
+            background-color: #f0d9b5;
+        }
+        
+        .dark { 
+            background-color: #b58863;
+        }
+        
+        .square:hover {
+            opacity: 0.8;
+            transform: scale(1.05);
+            z-index: 5;
+        }
+        
+        .selected {
+            background-color: #87CEEB !important;
+            box-shadow: inset 0 0 20px rgba(0,100,255,0.8);
+            transform: scale(1.1);
+            z-index: 10;
+            animation: selectedPulse 2s infinite;
+        }
+
+        @keyframes selectedPulse {
+            0%, 100% { box-shadow: inset 0 0 20px rgba(0,100,255,0.8); }
+            50% { box-shadow: inset 0 0 30px rgba(0,150,255,0.9); }
+        }
+        
+        .possible-move {
+            background-color: #90EE90 !important;
+            position: relative;
+        }
+
+        .possible-move::after {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            background-color: rgba(0, 128, 0, 0.8);
+            transform: translate(-50%, -50%);
+            animation: pulse 2s infinite;
+        }
+
+        .capture-move {
+            background-color: #FF6B6B !important;
+            position: relative;
+        }
+
+        .capture-move::after {
+            content: '';
+            position: absolute;
+            top: 2px;
+            right: 2px;
+            bottom: 2px;
+            left: 2px;
+            border: 3px solid rgba(255, 0, 0, 0.9);
+            border-radius: 8px;
+            animation: captureGlow 1.5s infinite alternate;
+        }
+
+        @keyframes captureGlow {
+            from { border-color: rgba(255, 0, 0, 0.9); }
+            to { border-color: rgba(255, 100, 100, 0.9); }
+        }
+
+        .last-move {
+            background-color: #FFE4B5 !important;
+            box-shadow: 0 0 15px rgba(255, 215, 0, 0.8);
+        }
+
+        .in-check {
+            background-color: #FF4444 !important;
+            animation: checkPulse 1s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 0.7; transform: translate(-50%, -50%) scale(1); }
+            50% { opacity: 1; transform: translate(-50%, -50%) scale(1.2); }
+        }
+
+        @keyframes checkPulse {
+            0% { box-shadow: 0 0 0 0 rgba(255, 68, 68, 0.7); }
+            70% { box-shadow: 0 0 0 20px rgba(255, 68, 68, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(255, 68, 68, 0); }
+        }
+
+        .controls {
+            text-align: center;
+            margin: 25px 0;
+            display: flex;
+            justify-content: center;
+            flex-wrap: wrap;
+            gap: 15px;
+        }
+
+        button {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 15px 30px;
+            border-radius: 30px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: bold;
+            transition: all 0.3s ease;
+            box-shadow: 0 6px 12px rgba(0,0,0,0.2);
+            position: relative;
+            overflow: hidden;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        button::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.3), transparent);
+            transition: left 0.5s;
+        }
+
+        button:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 8px 16px rgba(0,0,0,0.3);
+        }
+
+        button:hover::before {
+            left: 100%;
+        }
+
+        button:active {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+        }
+
+        button:disabled {
+            background: linear-gradient(135deg, #ccc 0%, #999 100%);
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        button:disabled:hover {
+            transform: none;
+            box-shadow: 0 6px 12px rgba(0,0,0,0.2);
+        }
+
+        .status {
+            text-align: center;
+            font-size: 20px;
+            font-weight: bold;
+            margin: 20px 0;
+            padding: 20px;
+            border-radius: 12px;
+            background: linear-gradient(135deg, #f9f9f9 0%, #e9e9e9 100%);
+            border: 3px solid #ddd;
+            box-shadow: 0 6px 12px rgba(0,0,0,0.1);
+            position: relative;
+            overflow: hidden;
+            color: #333;
+        }
+
+        .status.checkmate {
+            background: linear-gradient(135deg, #ff6b6b 0%, #ee5a24 100%);
+            color: white;
+            border-color: #c0392b;
+            animation: celebrate 0.6s ease-in-out;
+            box-shadow: 0 8px 16px rgba(238, 90, 36, 0.4);
+        }
+
+        .status.check {
+            background: linear-gradient(135deg, #ffa726 0%, #ff7043 100%);
+            color: white;
+            border-color: #e65100;
+            animation: warning 0.4s ease-in-out;
+            box-shadow: 0 8px 16px rgba(255, 112, 67, 0.4);
+        }
+
+        @keyframes celebrate {
+            0%, 100% { transform: scale(1); }
+            25% { transform: scale(1.05); }
+            75% { transform: scale(1.02); }
+        }
+
+        @keyframes warning {
+            0%, 100% { transform: translateX(0); }
+            25% { transform: translateX(-8px); }
+            75% { transform: translateX(8px); }
+        }
+
+        .thinking {
+            text-align: center;
+            color: #667eea;
+            font-weight: bold;
+            margin: 15px 0;
+            padding: 15px;
+            background: linear-gradient(135deg, rgba(102, 126, 234, 0.1) 0%, rgba(118, 75, 162, 0.1) 100%);
+            border: 2px solid rgba(102, 126, 234, 0.3);
+            border-radius: 10px;
+            animation: thinkingPulse 1.5s infinite;
+            font-size: 18px;
+        }
+
+        @keyframes thinkingPulse {
+            0%, 100% { opacity: 0.7; transform: scale(1); }
+            50% { opacity: 1; transform: scale(1.02); }
+        }
+
+        .move-history {
+            max-height: 180px;
+            overflow-y: auto;
+            background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+            padding: 20px;
+            border-radius: 12px;
+            margin-top: 25px;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+            border: 2px solid #dee2e6;
+            box-shadow: inset 0 2px 8px rgba(0,0,0,0.1);
+        }
+
+        .move-history::-webkit-scrollbar {
+            width: 10px;
+        }
+
+        .move-history::-webkit-scrollbar-track {
+            background: #f1f1f1;
+            border-radius: 5px;
+        }
+
+        .move-history::-webkit-scrollbar-thumb {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            border-radius: 5px;
+        }
+
+        .move-history::-webkit-scrollbar-thumb:hover {
+            background: linear-gradient(135deg, #5a6fd8, #6a4190);
+        }
+
+        .ai-info {
+            text-align: center;
+            margin: 15px 0;
+            padding: 15px;
+            background: linear-gradient(135deg, #e8f4fd 0%, #d1ecf1 100%);
+            border-radius: 10px;
+            font-size: 16px;
+            color: #155724;
+            border: 2px solid #b8daff;
+            position: relative;
+            font-weight: bold;
+        }
+
+        .ai-info::before {
+            content: '🤖';
+            font-size: 20px;
+            margin-right: 10px;
+        }
+
+        .sync-status {
+            text-align: center;
+            margin: 10px 0;
+            padding: 10px;
+            background: linear-gradient(135deg, #d4edda 0%, #c3e6cb 100%);
+            border-radius: 8px;
+            font-size: 14px;
+            color: #155724;
+            border: 2px solid #c3e6cb;
+            font-weight: bold;
+            transition: all 0.3s ease;
+        }
+
+        .sync-status.thinking {
+            background: linear-gradient(135deg, #fff3cd 0%, #ffeaa7 100%);
+            color: #856404;
+            border-color: #ffeaa7;
+        }
+
+        .ai-learning-info {
+            margin-top: 20px;
+            padding: 15px;
+            background: linear-gradient(135deg, rgba(102, 126, 234, 0.1) 0%, rgba(118, 75, 162, 0.1) 100%);
+            border-radius: 10px;
+            font-size: 13px;
+            text-align: center;
+            color: #495057;
+            border: 2px solid rgba(102, 126, 234, 0.2);
+            line-height: 1.6;
+        }
+
+        .loading {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid #f3f3f3;
+            border-radius: 50%;
+            border-top: 2px solid #667eea;
+            animation: spin 1s linear infinite;
+            margin-left: 8px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        /* Responsive design */
+        @media (max-width: 768px) {
+            .container {
+                padding: 20px;
+                margin: 10px;
+            }
+            
+            h1 {
+                font-size: 2rem;
+                margin-bottom: 20px;
+            }
+            
+            #chessboard {
+                width: 320px;
+                height: 320px;
+            }
+            
+            .square {
+                width: 40px;
+                height: 40px;
+                font-size: 24px;
+            }
+            
+            .game-info {
+                flex-direction: column;
+                gap: 10px;
+            }
+            
+            .controls {
+                flex-direction: column;
+                align-items: center;
+                gap: 10px;
+            }
+            
+            button {
+                width: 100%;
+                max-width: 250px;
+                padding: 12px 20px;
+                font-size: 14px;
+            }
+        }
+
+        @media (max-width: 480px) {
+            #chessboard {
+                width: 280px;
+                height: 280px;
+            }
+            
+            .square {
+                width: 35px;
+                height: 35px;
+                font-size: 20px;
+            }
+        }
+
+        /* Enhanced animations */
+        .piece-capture {
+            animation: captureAnimation 0.5s ease-in-out;
+        }
+
+        @keyframes captureAnimation {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.3); opacity: 0.7; }
+            100% { transform: scale(0.8); opacity: 0; }
+        }
+
+        .piece-move {
+            animation: moveAnimation 0.3s ease-in-out;
+        }
+
+        @keyframes moveAnimation {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.1); }
+            100% { transform: scale(1); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>♔ Smart Chess AI ♛</h1>
+        
+        <div class="game-info">
+            <div class="info-section">
+                <span>Player: </span><span id="current-player">White</span>
+            </div>
+            <div class="info-section">
+                <span>Mode: </span><span id="game-mode-display">vs AI</span>
+            </div>
+            <div class="info-section">
+                <span>Move: </span><span id="move-counter">1</span>
+            </div>
+        </div>
+
+        <div class="game-mode">
+            <label for="gameMode">Game Mode:</label>
+            <select id="gameMode" onchange="changeGameMode()">
+                <option value="ai">Centaur AI</option>
+                <option value="player">Player vs Player</option>
+            </select>
+        </div>
+
+        <div class="ai-info" id="ai-info">
+            Games Played: <span id="games-played">0</span> | 
+            AI Win Rate: <span id="win-rate">50%</span> |
+        </div>
+        
+        <div class="sync-status" id="sync-status">Ready</div>
+        
+        <div id="status" class="status">White to move</div>
+        <div id="thinking" class="thinking" style="display: none;">
+            🤔 AI is calculating the best move<span class="loading"></span>
+        </div>
+        
+        <div id="chessboard"></div>
+        
+        <div class="controls">
+            <button onclick="newGame()" title="Start a new game">🎯 New Game</button>
+            <button onclick="undoMove()" title="Undo the last move">↶ Undo Move</button>
+            <button onclick="switchSides()" title="Switch sides with AI">🔄 Switch Sides</button>
+        </div>
+        
+        <div class="move-history">
+            <strong>📝 Move History:</strong>
+            <div id="move-list">Game ready to start</div>
+        </div>
+
+        <div class="ai-learning-info">
+            <strong>🧠 Smart AI Features:</strong> 
+            This AI uses a professional opening book, learns from games, and adapts its difficulty. 
+            It employs advanced evaluation including piece positioning, king safety, mobility, and tactical awareness.
+        </div>
+    </div>
+
+    <!-- Load ALL JavaScript files in correct order -->
+    <script src="chess-ai-database.js"></script>
+    <script src="chess-endgame.js"></script>
+    <script src="chess-game-database.js"></script>
+    <script src="chess-game.js"></script>
+
+    <script>
+        // Enhanced status updates with animations
+        function updateStatusWithAnimation(message, type = 'normal') {
+            const statusElement = document.getElementById('status');
+            if (statusElement) {
+                statusElement.textContent = message;
+                
+                // Remove existing classes
+                statusElement.classList.remove('checkmate', 'check', 'normal');
+                
+                // Add appropriate class
+                statusElement.classList.add(type);
+            }
+        }
+
+        // Keyboard shortcuts
+        document.addEventListener('keydown', function(e) {
+            if (e.ctrlKey || e.metaKey) {
+                switch(e.key) {
+                    case 'z':
+                        e.preventDefault();
+                        if (typeof undoMove === 'function') undoMove();
+                        break;
+                    case 'n':
+                        e.preventDefault();
+                        if (typeof newGame === 'function') newGame();
+                        break;
+                    case 's':
+                        e.preventDefault();
+                        if (typeof switchSides === 'function') switchSides();
+                        break;
+                }
+            }
+            
+            // Space bar for new game
+            if (e.code === 'Space' && e.target.tagName !== 'SELECT') {
+                e.preventDefault();
+                if (typeof newGame === 'function') newGame();
+            }
+        });
+
+        // Enhanced piece animation
+        function animatePieceMove(fromSquare, toSquare) {
+            const fromElement = document.getElementById(fromSquare);
+            const toElement = document.getElementById(toSquare);
+            
+            if (fromElement) {
+                fromElement.classList.add('piece-move');
+                setTimeout(() => fromElement.classList.remove('piece-move'), 300);
+            }
+            
+            if (toElement) {
+                toElement.classList.add('piece-move');
+                setTimeout(() => toElement.classList.remove('piece-move'), 300);
+            }
+        }
+
+        // Welcome message and feature showcase
+        window.addEventListener('load', function() {
+            setTimeout(() => {
+                console.log('🎯 Welcome to Smart Chess AI! 🤖');
+                console.log('🔥 Enhanced Features:');
+                console.log('   • Professional opening database with 50+ openings');
+                console.log('   • Endgame tablebase knowledge');
+                console.log('   • Pattern learning from master games');
+                console.log('   • Adaptive difficulty that learns from your play style');
+                console.log('   • Advanced position evaluation with piece tables');
+                console.log('   • Enhanced minimax with alpha-beta pruning');
+                console.log('   • King safety and mobility evaluation');
+                console.log('   • Beautiful animations and responsive design');
+                console.log('🎮 Keyboard shortcuts:');
+                console.log('   • Ctrl+Z: Undo move');
+                console.log('   • Ctrl+N: New game');
+                console.log('   • Ctrl+S: Switch sides');
+                console.log('   • Spacebar: New game');
+                console.log('🚀 The AI will get stronger as you play more games!');
+            }, 1000);
+        });
+
+        // Add visual feedback for moves
+        function addMoveEffect(square) {
+            const element = document.getElementById(square);
+            if (element) {
+                element.style.transform = 'scale(1.1)';
+                element.style.transition = 'transform 0.2s ease';
+                setTimeout(() => {
+                    element.style.transform = 'scale(1)';
+                }, 200);
+            }
+        }
+
+        // Enhanced error handling
+        window.addEventListener('error', function(e) {
+            console.error('Game error:', e.error);
+            // Don't show error to user, just log it
+        });
+
+        // Prevent context menu on chess board for better mobile experience
+        document.addEventListener('contextmenu', function(e) {
+            if (e.target.classList.contains('square')) {
+                e.preventDefault();
+            }
+        });
+
+        // Touch support for mobile
+        let touchStartSquare = null;
+        document.addEventListener('touchstart', function(e) {
+            if (e.target.classList.contains('square')) {
+                touchStartSquare = e.target.id;
+                e.preventDefault();
+            }
+        });
+
+        document.addEventListener('touchend', function(e) {
+            if (e.target.classList.contains('square') && touchStartSquare === e.target.id) {
+                e.target.click();
+            }
+            touchStartSquare = null;
+        });
+
+        // Prevent zoom on double tap for better mobile experience
+        let lastTouchEnd = 0;
+        document.addEventListener('touchend', function(event) {
+            const now = (new Date()).getTime();
+            if (now - lastTouchEnd <= 300) {
+                event.preventDefault();
+            }
+            lastTouchEnd = now;
+        }, false);
+
+        // Performance monitoring
+        let gameStartTime = Date.now();
+        function trackPerformance() {
+            const gameTime = Date.now() - gameStartTime;
+            if (gameTime > 60000) { // After 1 minute
+                console.log('🔧 Game performance: Running smoothly for', Math.round(gameTime/1000), 'seconds');
+                gameStartTime = Date.now(); // Reset timer
+            }
+        }
+        
+        setInterval(trackPerformance, 60000); // Check every minute
+
+        // Load game after DOM is ready
+        document.addEventListener('DOMContentLoaded', function() {
+            console.log('🎯 Chess game interface loaded successfully!');
+            
+            // Check which files loaded
+            setTimeout(() => {
+                console.log('📂 Loaded files check:');
+                console.log('   • chess-ai-database.js:', typeof ChessAILearner !== 'undefined' ? '✅' : '❌');
+                console.log('   • chess-endgame.js:', typeof ChessEndgameEngine !== 'undefined' ? '✅' : '❌');
+                console.log('   • chess-game-database.js:', typeof GamePatternLearner !== 'undefined' ? '✅' : '❌');
+                console.log('   • chess-game.js:', typeof newGame !== 'undefined' ? '✅' : '❌');
+                
+                if (typeof newGame === 'function') {
+                    console.log('🚀 Game functions loaded successfully!');
+                } else {
+                    console.log('⚠️ Game functions not loaded yet, please refresh if issues persist');
+                }
+            }, 500);
+        });
+
+        // Fallback error handling
+        window.onerror = function(msg, url, lineNo, columnNo, error) {
+            console.log('Error: ' + msg + '\nURL: ' + url + '\nLine: ' + lineNo + '\nColumn: ' + columnNo + '\nError object: ' + JSON.stringify(error));
+            return false;
+        };
+    </script>
+</body>
+</html>
