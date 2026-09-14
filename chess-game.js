@@ -1,6 +1,6 @@
 // chess-game.js
 // Enhanced chess game with dynamic piece activity + threat-based evaluation
-// VERSION: 2.4.2 - Branch-pruned caches: only keep what's on the actual game line
+// VERSION: 2.4.2 - Full SEE + Activity Evaluation + Threat Detection + Branch-Pruned Caches
 // COMPATIBLE WITH: chess-ai-database.js (v2.0) and chess-game-database.js (v1.1)
 
 const GAME_VERSION = "2.4.2";
@@ -10,35 +10,26 @@ let openingBook = null;
 let patternLearner = null;
 
 // ========== BRANCH-AWARE EVALUATION CACHE ==========
-// Each cache entry is tagged with the move-history prefix under which it was computed.
-// When the opponent makes a move, we prune all entries whose prefix doesn't match
-// the actual game line. This keeps only the branch the game actually followed.
-
-const evalCache = new Map();          // boardHash|player -> { value, prefix }
-const activityCache = new Map();      // boardHash|player -> { value, prefix }
-const threatCache = new Map();        // boardHash|player -> { value, prefix }
-const attackCache = new Map();        // boardHash|row,col|color -> { value, prefix }
-const reachableCache = new Map();     // boardHash|row,col -> { value, prefix }
-const kingDangerCache = new Map();    // boardHash|player -> { value, prefix }
-const promotionCache = new Map();     // boardHash|player -> { value, prefix }
-const mateCache = new Map();          // boardHash|player -> { value, prefix }
+const evalCache = new Map();
+const activityCache = new Map();
+const threatCache = new Map();
+const attackCache = new Map();
+const reachableCache = new Map();
+const kingDangerCache = new Map();
+const promotionCache = new Map();
+const mateCache = new Map();
 
 const CACHE_LIMIT = 500000;
 
 let LAYER_HITS = 0;
 let LAYER_MISSES = 0;
-let PRUNED_LAST_TURN = 0;
 
-// The move-history prefix to tag new entries with.
-// Set right before each search.
 let currentSearchPrefix = "";
 
 function setSearchPrefix(prefix) {
     currentSearchPrefix = prefix;
 }
 
-// Prune all caches so only entries whose prefix is a prefix of the actual game line survive.
-// Called after each real move.
 function pruneCachesToLine(actualLine) {
     const linePrefix = actualLine.join("|");
     let pruned = 0;
@@ -49,9 +40,6 @@ function pruneCachesToLine(actualLine) {
     for (const cache of caches) {
         const toDelete = [];
         for (const [key, entry] of cache) {
-            // Keep if the entry's prefix is a prefix of the real line,
-            // OR if the real line is a prefix of the entry's prefix
-            // (entries computed deeper than we've played are still potentially useful).
             const entryPrefix = entry.prefix || "";
             const keep = linePrefix.startsWith(entryPrefix) || entryPrefix.startsWith(linePrefix);
             if (!keep) toDelete.push(key);
@@ -60,8 +48,7 @@ function pruneCachesToLine(actualLine) {
         pruned += toDelete.length;
     }
     
-    PRUNED_LAST_TURN = pruned;
-    console.log(`✂️ Pruned ${pruned} irrelevant cache entries (kept branch: ${linePrefix || "start"})`);
+    console.log(`✂️ Pruned ${pruned} irrelevant cache entries`);
 }
 
 function clearAllCaches() {
@@ -75,15 +62,12 @@ function clearAllCaches() {
     mateCache.clear();
     LAYER_HITS = 0;
     LAYER_MISSES = 0;
-    PRUNED_LAST_TURN = 0;
     currentSearchPrefix = "";
-    console.log("🧠 All evaluation caches cleared");
 }
 
 function cacheGet(cache, key) {
     const entry = cache.get(key);
     if (entry === undefined) return undefined;
-    // Only return cached value if it belongs to a line we still care about
     const p = entry.prefix || "";
     const line = currentSearchPrefix;
     if (line.startsWith(p) || p.startsWith(line)) {
@@ -412,50 +396,73 @@ function isSquareAttackedByOpponent(boardState, row, col, player) {
     return isSquareAttackedForPosition(boardState, row, col, opponent);
 }
 
-// ========== STATIC EXCHANGE EVALUATION (SEE) ==========
+// ========== FULL RECURSIVE STATIC EXCHANGE EVALUATION ==========
 
-function evaluateCaptureSafety(boardState, fromRow, fromCol, toRow, toCol, player) {
-    const attacker = boardState[fromRow][fromCol];
-    const victim = boardState[toRow][toCol];
-    if (!victim) return 0;
-    
-    const defenderExists = isPieceDefended(boardState, toRow, toCol, player === 'white' ? 'black' : 'white');
-    if (!defenderExists) return PIECE_VALUES[victim];
-    
-    let gain = PIECE_VALUES[victim];
-    const newBoard = makeTestMoveForPosition(boardState, fromRow, fromCol, toRow, toCol);
-    if (!newBoard) return 0;
-    
-    const opponent = player === 'white' ? 'black' : 'white';
-    const recapturer = findLowestValueAttacker(newBoard, toRow, toCol, opponent);
-    
-    if (recapturer) {
-        gain -= PIECE_VALUES[attacker];
-        const attackerValue = PIECE_VALUES[recapturer.piece];
-        const ourRecapturer = findLowestValueAttacker(newBoard, toRow, toCol, player);
-        if (ourRecapturer && PIECE_VALUES[ourRecapturer.piece] < attackerValue) gain += attackerValue;
-    }
-    return gain;
-}
-
-function findLowestValueAttacker(boardState, targetRow, targetCol, attackerColor) {
-    let lowestValue = Infinity;
+// Find the cheapest piece of a given color that can capture on the target square.
+function findCheapestAttacker(boardState, targetRow, targetCol, color) {
+    let bestValue = Infinity;
     let bestAttacker = null;
+    
     for (let row = 0; row < 8; row++) {
         for (let col = 0; col < 8; col++) {
             const piece = boardState[row] && boardState[row][col];
-            if (piece && isPlayerPieceForPosition(piece, attackerColor)) {
-                if (canPieceAttackForPosition(piece, row, col, targetRow, targetCol, boardState)) {
-                    const value = PIECE_VALUES[piece] || 0;
-                    if (value < lowestValue) {
-                        lowestValue = value;
-                        bestAttacker = { piece, row, col };
-                    }
+            if (!piece || !isPlayerPieceForPosition(piece, color)) continue;
+            if (canPieceAttackForPosition(piece, row, col, targetRow, targetCol, boardState)) {
+                const value = PIECE_VALUES[piece] || 0;
+                if (value < bestValue) {
+                    bestValue = value;
+                    bestAttacker = { piece, row, col, value };
                 }
             }
         }
     }
     return bestAttacker;
+}
+
+// Standard recursive SEE. Returns the net material swing from the perspective
+// of the side to move on this square. Uses the classic formula:
+//   seeValue = max(0, victimValue - seeRecursive(opponentOnSameSquare))
+function seeRecursive(boardState, targetRow, targetCol, sideToMove) {
+    const attacker = findCheapestAttacker(boardState, targetRow, targetCol, sideToMove);
+    if (!attacker) return 0;
+    
+    const victim = boardState[targetRow][targetCol];
+    const victimValue = victim ? (PIECE_VALUES[victim] || 0) : 0;
+    
+    // Make the capture
+    const newBoard = makeTestMoveForPosition(boardState, attacker.row, attacker.col, targetRow, targetCol);
+    if (!newBoard) return victimValue;
+    
+    const opponent = sideToMove === 'white' ? 'black' : 'white';
+    const opponentBest = seeRecursive(newBoard, targetRow, targetCol, opponent);
+    
+    const net = victimValue - opponentBest;
+    return Math.max(0, net);
+}
+
+// Wrapper: returns the SEE for a specific move (net material swing for `player`).
+function evaluateCaptureSafety(boardState, fromRow, fromCol, toRow, toCol, player) {
+    const victim = boardState[toRow][toCol];
+    if (!victim) return 0;
+    
+    const victimValue = PIECE_VALUES[victim] || 0;
+    
+    // Make the capture
+    const newBoard = makeTestMoveForPosition(boardState, fromRow, fromCol, toRow, toCol);
+    if (!newBoard) return victimValue;
+    
+    const opponent = player === 'white' ? 'black' : 'white';
+    
+    // From opponent's perspective, what can they extract on this square?
+    const opponentBest = seeRecursive(newBoard, toRow, toCol, opponent);
+    
+    // Net for us: victim value minus whatever opponent extracts
+    return victimValue - opponentBest;
+}
+
+// Kept for internal minimax compatibility — just calls the SEE wrapper
+function findLowestValueAttacker(boardState, targetRow, targetCol, attackerColor) {
+    return findCheapestAttacker(boardState, targetRow, targetCol, attackerColor);
 }
 
 function getHungPieceValue(boardState, fromRow, fromCol, toRow, toCol, player) {
@@ -1076,8 +1083,9 @@ function quiescenceSearch(boardState, alpha, beta, player, qDepth) {
     
     for (const move of captureMoves) {
         const newBoard = makeTestMoveForPosition(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol);
+        // Only skip truly terrible captures (SEE < -100). Allow losing recaptures.
         const seeScore = evaluateCaptureSafety(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol, player);
-        if (seeScore < 0) continue;
+        if (seeScore < -100) continue;
         const score = -quiescenceSearch(newBoard, -beta, -alpha, opponent, qDepth - 1);
         if (score >= beta) return beta;
         if (score > alpha) alpha = score;
@@ -1128,10 +1136,7 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
 
         for (const move of moves) {
             const targetPiece = boardState[move.toRow][move.toCol];
-            if (targetPiece) {
-                const captureSafety = evaluateCaptureSafety(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol, player);
-                if (captureSafety < -200) continue;
-            }
+            // No hard filter — let SEE feed the eval naturally
             const newBoard = makeTestMoveForPosition(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol);
             const evaluation = minimaxWithRisk(newBoard, depth - 1, alpha, beta, false, nextPlayer, moveNumber + 1, trackWorstCase);
             let evalValue = typeof evaluation === 'object' ? evaluation.best : evaluation;
@@ -1140,8 +1145,6 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
                 const captureSafety = evaluateCaptureSafety(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol, player);
                 evalValue += captureSafety;
             }
-            const hungValue = getHungPieceValue(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol, player);
-            if (hungValue > 0) evalValue -= hungValue;
             
             maxEval = Math.max(maxEval, evalValue);
             if (trackWorstCase) {
@@ -1159,10 +1162,6 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
 
         for (const move of moves) {
             const targetPiece = boardState[move.toRow][move.toCol];
-            if (targetPiece) {
-                const captureSafety = evaluateCaptureSafety(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol, player);
-                if (captureSafety < -200) continue;
-            }
             const newBoard = makeTestMoveForPosition(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol);
             const evaluation = minimaxWithRisk(newBoard, depth - 1, alpha, beta, true, nextPlayer, moveNumber + 1, trackWorstCase);
             let evalValue = typeof evaluation === 'object' ? evaluation.best : evaluation;
@@ -1171,8 +1170,6 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
                 const captureSafety = evaluateCaptureSafety(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol, player);
                 evalValue -= captureSafety;
             }
-            const hungValue = getHungPieceValue(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol, player);
-            if (hungValue > 0) evalValue += hungValue;
             
             minEval = Math.min(minEval, evalValue);
             if (trackWorstCase) {
@@ -1221,7 +1218,6 @@ let riskAssessor = new RiskAssessment();
 // ========== SEARCH ENTRY ==========
 
 function findBestMoveWithRiskAssessment() {
-    // Tag any new cache entries with the current game-line prefix
     setSearchPrefix(moveHistory.join("|"));
     
     const allMoves = getAllPossibleMoves(currentPlayer);
@@ -1252,12 +1248,6 @@ function findBestMoveWithRiskAssessment() {
             if (isEndlessCheck(testHistory, currentPlayer)) continue;
         }
         
-        const hungValue = getHungPieceValue(board, move.fromRow, move.fromCol, move.toRow, move.toCol, currentPlayer);
-        const targetPiece = board[move.toRow][move.toCol];
-        const targetValue = targetPiece ? PIECE_VALUES[targetPiece] : 0;
-        
-        if (hungValue > 0 && hungValue >= targetValue) continue;
-        
         let cachedResult = null;
         if (moveTree && SEARCH_CONFIG.useMemory) {
             cachedResult = moveTree.getCachedEvaluation(move, board, currentPlayer, castlingRights, enPassantTarget);
@@ -1281,11 +1271,11 @@ function findBestMoveWithRiskAssessment() {
             const worstCase = typeof worstResult === 'object' ? worstResult.best : worstResult;
             let bestCase = typeof bestResult === 'object' ? bestResult.best : bestResult;
             
+            const targetPiece = board[move.toRow][move.toCol];
             if (targetPiece) {
                 const captureSafety = evaluateCaptureSafety(board, move.fromRow, move.fromCol, move.toRow, move.toCol, currentPlayer);
                 bestCase += captureSafety;
             }
-            if (hungValue > 0) bestCase -= hungValue;
             
             evaluatedMoves.push({ move, bestCase, worstCase, depth: searchDepth });
             
@@ -1333,13 +1323,6 @@ function findBestMove() {
 }
 
 // ========== CORE GAME FUNCTIONS ==========
-
-function isPlayerPiece(piece, player) {
-    if (!piece) return false;
-    const whitePieces = ['♔', '♕', '♖', '♗', '♘', '♙'];
-    const blackPieces = ['♚', '♛', '♜', '♝', '♞', '♟'];
-    return player === 'white' ? whitePieces.includes(piece) : blackPieces.includes(piece);
-}
 
 function createBoard() {
     const boardElement = document.getElementById('chessboard');
@@ -1593,7 +1576,6 @@ function makeMove(fromRow, fromCol, toRow, toCol) {
     moveHistory.push(algebraicMove);
     updateMoveHistory();
     
-    // Prune caches to the branch we actually took
     pruneCachesToLine(moveHistory);
     
     createBoard();
@@ -1870,7 +1852,6 @@ function undoMove() {
     gameOver = false;
     if (moveTree) moveTree.activeLineMoves.pop();
     
-    // Re-prune caches to the new (shorter) line
     pruneCachesToLine(moveHistory);
     
     createBoard();
@@ -1923,4 +1904,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - Branch-pruned caches active`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - Full SEE + Recapture Fix`);
