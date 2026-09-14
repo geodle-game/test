@@ -534,11 +534,6 @@
                 <option value="player">Player vs Player</option>
             </select>
         </div>
-
-        <div class="ai-info" id="ai-info">
-            Games Played: <span id="games-played">0</span> | 
-            AI Win Rate: <span id="win-rate">50%</span> |
-        </div>
         
         <div class="sync-status" id="sync-status">Ready</div>
         
@@ -579,11 +574,7 @@
             const statusElement = document.getElementById('status');
             if (statusElement) {
                 statusElement.textContent = message;
-                
-                // Remove existing classes
                 statusElement.classList.remove('checkmate', 'check', 'normal');
-                
-                // Add appropriate class
                 statusElement.classList.add(type);
             }
         }
@@ -607,7 +598,6 @@
                 }
             }
             
-            // Space bar for new game
             if (e.code === 'Space' && e.target.tagName !== 'SELECT') {
                 e.preventDefault();
                 if (typeof newGame === 'function') newGame();
@@ -630,29 +620,14 @@
             }
         }
 
-        // Welcome message and feature showcase
+        // Welcome message
         window.addEventListener('load', function() {
             setTimeout(() => {
                 console.log('🎯 Welcome to Smart Chess AI! 🤖');
-                console.log('🔥 Enhanced Features:');
-                console.log('   • Professional opening database with 50+ openings');
-                console.log('   • Endgame tablebase knowledge');
-                console.log('   • Pattern learning from master games');
-                console.log('   • Adaptive difficulty that learns from your play style');
-                console.log('   • Advanced position evaluation with piece tables');
-                console.log('   • Enhanced minimax with alpha-beta pruning');
-                console.log('   • King safety and mobility evaluation');
-                console.log('   • Beautiful animations and responsive design');
-                console.log('🎮 Keyboard shortcuts:');
-                console.log('   • Ctrl+Z: Undo move');
-                console.log('   • Ctrl+N: New game');
-                console.log('   • Ctrl+S: Switch sides');
-                console.log('   • Spacebar: New game');
-                console.log('🚀 The AI will get stronger as you play more games!');
             }, 1000);
         });
 
-        // Add visual feedback for moves
+        // Visual feedback for moves
         function addMoveEffect(square) {
             const element = document.getElementById(square);
             if (element) {
@@ -664,13 +639,12 @@
             }
         }
 
-        // Enhanced error handling
+        // Error handling
         window.addEventListener('error', function(e) {
             console.error('Game error:', e.error);
-            // Don't show error to user, just log it
         });
 
-        // Prevent context menu on chess board for better mobile experience
+        // Prevent context menu on chess board
         document.addEventListener('contextmenu', function(e) {
             if (e.target.classList.contains('square')) {
                 e.preventDefault();
@@ -693,7 +667,7 @@
             touchStartSquare = null;
         });
 
-        // Prevent zoom on double tap for better mobile experience
+        // Prevent zoom on double tap
         let lastTouchEnd = 0;
         document.addEventListener('touchend', function(event) {
             const now = (new Date()).getTime();
@@ -703,41 +677,14 @@
             lastTouchEnd = now;
         }, false);
 
-        // Performance monitoring
-        let gameStartTime = Date.now();
-        function trackPerformance() {
-            const gameTime = Date.now() - gameStartTime;
-            if (gameTime > 60000) { // After 1 minute
-                console.log('🔧 Game performance: Running smoothly for', Math.round(gameTime/1000), 'seconds');
-                gameStartTime = Date.now(); // Reset timer
-            }
-        }
-        
-        setInterval(trackPerformance, 60000); // Check every minute
-
         // Load game after DOM is ready
         document.addEventListener('DOMContentLoaded', function() {
             console.log('🎯 Chess game interface loaded successfully!');
-            
-            // Check which files loaded
-            setTimeout(() => {
-                console.log('📂 Loaded files check:');
-                console.log('   • chess-ai-database.js:', typeof ChessAILearner !== 'undefined' ? '✅' : '❌');
-                console.log('   • chess-endgame.js:', typeof ChessEndgameEngine !== 'undefined' ? '✅' : '❌');
-                console.log('   • chess-game-database.js:', typeof GamePatternLearner !== 'undefined' ? '✅' : '❌');
-                console.log('   • chess-game.js:', typeof newGame !== 'undefined' ? '✅' : '❌');
-                
-                if (typeof newGame === 'function') {
-                    console.log('🚀 Game functions loaded successfully!');
-                } else {
-                    console.log('⚠️ Game functions not loaded yet, please refresh if issues persist');
-                }
-            }, 500);
         });
 
         // Fallback error handling
         window.onerror = function(msg, url, lineNo, columnNo, error) {
-            console.log('Error: ' + msg + '\nURL: ' + url + '\nLine: ' + lineNo + '\nColumn: ' + columnNo + '\nError object: ' + JSON.stringify(error));
+            console.log('Error: ' + msg + '\nURL: ' + url + '\nLine: ' + lineNo);
             return false;
         };
     </script>
