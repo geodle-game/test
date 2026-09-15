@@ -1,6 +1,6 @@
 // chess-game.js
 // Enhanced chess game with dynamic piece activity + threat-based evaluation
-// VERSION: 2.4.2 - Killer Moves + History + Pawn Shield + Hanging Pieces
+// VERSION: 2.4.2 - Checkmate Detection + Quiescence Fix + Root Mate Net
 // COMPATIBLE WITH: chess-ai-database.js (v2.0) and chess-game-database.js (v1.1)
 
 const GAME_VERSION = "2.4.2";
@@ -961,7 +961,6 @@ function evaluatePositionForSearch(boardState, player, moveNumber) {
     let evaluation = 0;
     const opponent = player === 'white' ? 'black' : 'white';
     
-    // 1. Material
     for (let row = 0; row < 8; row++) {
         for (let col = 0; col < 8; col++) {
             const piece = boardState[row] && boardState[row][col];
@@ -972,33 +971,18 @@ function evaluatePositionForSearch(boardState, player, moveNumber) {
         }
     }
     
-    // 2. Piece activity
     evaluation += evaluateAllPieceActivity(boardState, 'white');
     evaluation -= evaluateAllPieceActivity(boardState, 'black');
-    
-    // 3. Threats
     evaluation -= evaluateOpponentThreats(boardState, player) * 0.5;
-    
-    // 4. King safety — bumped weight from 0.3 to 0.5
     evaluation -= evaluateKingDanger(boardState, player) * 0.5;
     evaluation += evaluateKingDanger(boardState, opponent) * 0.5;
-    
-    // 5. Pawn shield — directly penalizes f6/h6-style moves
     evaluation += evaluatePawnShield(boardState, player);
     evaluation -= evaluatePawnShield(boardState, opponent);
-    
-    // 6. Hanging pieces — detects when our pieces are under threat
     evaluation += evaluateHangingPieces(boardState, player);
     evaluation -= evaluateHangingPieces(boardState, opponent);
-    
-    // 7. Promotion urgency
     evaluation += evaluatePromotionThreats(boardState, player);
     evaluation -= evaluatePromotionThreats(boardState, opponent);
-    
-    // 8. Endgame check penalty
     evaluation += getEndgameCheckPenalty(boardState, player, moveHistory);
-    
-    // 9. Checkmate bonus
     evaluation += evaluateCheckmatePatterns(boardState, player);
     
     cacheSet(evalCache, key, evaluation);
@@ -1204,16 +1188,28 @@ const SEARCH_CONFIG = {
 let transpositionTable = new Map();
 
 function quiescenceSearch(boardState, alpha, beta, player, qDepth) {
+    // Detect checkmate/stalemate at the top — quiescence is not exempt
+    const moves = getAllPossibleMovesForPosition(boardState, player);
+    if (moves.length === 0) {
+        if (isKingInCheckForPosition(boardState, player)) {
+            return -20000;
+        }
+        return 0;
+    }
+    
     if (qDepth <= 0) return evaluatePositionForSearch(boardState, player, moveCount);
     
     let standPat = evaluatePositionForSearch(boardState, player, moveCount);
     if (standPat >= beta) return beta;
     if (alpha < standPat) alpha = standPat;
     
-    const allMoves = getAllPossibleMovesForPosition(boardState, player);
-    const captureMoves = allMoves.filter(move => boardState[move.toRow][move.toCol] !== '');
+    // If in check, consider ALL legal moves (evasions). Otherwise just captures.
+    const inCheck = isKingInCheckForPosition(boardState, player);
+    const candidateMoves = inCheck
+        ? moves
+        : moves.filter(move => boardState[move.toRow][move.toCol] !== '');
     
-    captureMoves.sort((a, b) => {
+    candidateMoves.sort((a, b) => {
         const victimA = PIECE_VALUES[boardState[a.toRow][a.toCol]] || 0;
         const victimB = PIECE_VALUES[boardState[b.toRow][b.toCol]] || 0;
         const attackerA = PIECE_VALUES[boardState[a.fromRow][a.fromCol]] || 0;
@@ -1223,9 +1219,11 @@ function quiescenceSearch(boardState, alpha, beta, player, qDepth) {
     
     const opponent = player === 'white' ? 'black' : 'white';
     
-    for (const move of captureMoves) {
-        const seeScore = evaluateCaptureSafety(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol, player);
-        if (seeScore < 0) continue;
+    for (const move of candidateMoves) {
+        if (!inCheck) {
+            const seeScore = evaluateCaptureSafety(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol, player);
+            if (seeScore < 0) continue;
+        }
         const newBoard = makeTestMoveForPosition(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol);
         const score = -quiescenceSearch(newBoard, -beta, -alpha, opponent, qDepth - 1);
         if (score >= beta) return beta;
@@ -1237,19 +1235,29 @@ function quiescenceSearch(boardState, alpha, beta, player, qDepth) {
 function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, player, moveNumber, trackWorstCase = false) {
     if (!boardState) return 0;
     
-    const inCheck = isKingInCheckForPosition(boardState, player);
-    if (inCheck) depth += 1;
+    // Move generation FIRST — so we detect checkmate/stalemate at any depth
+    const moves = getAllPossibleMovesForPosition(boardState, player);
     
-    if (depth === 0) {
+    // Checkmate / stalemate detection at ANY depth
+    if (moves.length === 0) {
+        if (isKingInCheckForPosition(boardState, player)) {
+            // Mate: prefer faster mates (add depth bonus so shallower mates score higher)
+            return isMaximizingPlayer ? (-20000 - depth) : (20000 + depth);
+        }
+        return 0; // Stalemate
+    }
+    
+    const inCheck = isKingInCheckForPosition(boardState, player);
+    
+    if (depth <= 0 && !inCheck) {
+        // Only fall to quiescence if NOT in check — otherwise we might miss mate
         return quiescenceSearch(boardState, alpha, beta, player, SEARCH_CONFIG.quiescenceDepth);
     }
-
-    const moves = getAllPossibleMovesForPosition(boardState, player);
-    if (moves.length === 0) {
-        if (isKingInCheckForPosition(boardState, player)) return isMaximizingPlayer ? -20000 : 20000;
-        return 0;
-    }
-
+    
+    // Check extension: if in check at depth exhaustion, force at least depth 1
+    if (depth <= 0) depth = 1;
+    
+    // Order moves
     moves.sort((a, b) => {
         return scoreMoveForOrdering(boardState, b, player, depth) - scoreMoveForOrdering(boardState, a, player, depth);
     });
@@ -1372,6 +1380,39 @@ function findBestMoveWithRiskAssessment() {
     const allMoves = getAllPossibleMoves(currentPlayer);
     if (allMoves.length === 0) return null;
     
+    const opponentColor = currentPlayer === 'white' ? 'black' : 'white';
+    
+    // ROOT MATE SAFETY NET: if any move is immediate checkmate, play it
+    for (const move of allMoves) {
+        const newBoard = makeTestMoveForPosition(board, move.fromRow, move.fromCol, move.toRow, move.toCol);
+        if (newBoard && isKingInCheckForPosition(newBoard, opponentColor)) {
+            const opponentMoves = getAllPossibleMovesForPosition(newBoard, opponentColor);
+            if (opponentMoves.length === 0) {
+                console.log(`👑 Immediate mate found: ${toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol)}`);
+                return move;
+            }
+        }
+    }
+    
+    // ROOT MATE-IN-1 PREVENTION: if opponent threatens mate next move, prioritize preventing it
+    // Detect if opponent (after any of our moves) has an immediate mate available
+    // This is handled by the search naturally, but we log it if found
+    const opponentMovesNow = getAllPossibleMovesForPosition(board, opponentColor);
+    let opponentHasMateThreat = false;
+    for (const om of opponentMovesNow) {
+        const oppBoard = makeTestMoveForPosition(board, om.fromRow, om.fromCol, om.toRow, om.toCol);
+        if (oppBoard && isKingInCheckForPosition(oppBoard, currentPlayer)) {
+            const ourResponses = getAllPossibleMovesForPosition(oppBoard, currentPlayer);
+            if (ourResponses.length === 0) {
+                opponentHasMateThreat = true;
+                break;
+            }
+        }
+    }
+    if (opponentHasMateThreat) {
+        console.log(`⚠️ Opponent has mate-in-1 threat — search must find the escape`);
+    }
+    
     if (openingBook && moveHistory.length < 12) {
         const openingMoveAlgebraic = openingBook.getOpeningRecommendation(moveHistory);
         if (openingMoveAlgebraic) {
@@ -1426,9 +1467,9 @@ function findBestMoveWithRiskAssessment() {
             const newBoard = makeTestMoveForPosition(board, move.fromRow, move.fromCol, move.toRow, move.toCol);
             
             const bestResult = minimaxWithRisk(newBoard, searchDepth - 1, -Infinity, Infinity, false, 
-                currentPlayer === 'white' ? 'black' : 'white', moveCount + 1, false);
+                opponentColor, moveCount + 1, false);
             const worstResult = minimaxWithRisk(newBoard, searchDepth - 1, -Infinity, Infinity, false, 
-                currentPlayer === 'white' ? 'black' : 'white', moveCount + 1, true);
+                opponentColor, moveCount + 1, true);
             
             const worstCase = typeof worstResult === 'object' ? worstResult.best : worstResult;
             let bestCase = typeof bestResult === 'object' ? bestResult.best : bestResult;
@@ -1451,7 +1492,7 @@ function findBestMoveWithRiskAssessment() {
         for (const move of allMoves) {
             const newBoard = makeTestMoveForPosition(board, move.fromRow, move.fromCol, move.toRow, move.toCol);
             const bestResult = minimaxWithRisk(newBoard, searchDepth - 1, -Infinity, Infinity, false, 
-                currentPlayer === 'white' ? 'black' : 'white', moveCount + 1, false);
+                opponentColor, moveCount + 1, false);
             const bestCase = typeof bestResult === 'object' ? bestResult.best : bestResult;
             evaluatedMoves.push({ move, bestCase, worstCase: bestCase - 100, depth: searchDepth });
         }
@@ -2068,4 +2109,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - Pawn shield + Hanging pieces + Killer moves active`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - Checkmate detection fixed`);
