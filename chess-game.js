@@ -1,6 +1,6 @@
 // chess-game.js
 // Enhanced chess game with dynamic piece activity + threat-based evaluation
-// VERSION: 2.4.2 - Full SEE + Activity Evaluation + Threat Detection + Branch-Pruned Caches
+// VERSION: 2.4.2 - Killer Moves + History Heuristic + SEE Ordering
 // COMPATIBLE WITH: chess-ai-database.js (v2.0) and chess-game-database.js (v1.1)
 
 const GAME_VERSION = "2.4.2";
@@ -89,6 +89,59 @@ function boardToHash(boardState) {
         }
     }
     return hash;
+}
+
+// ========== SEARCH HEURISTICS (KILLER MOVES + HISTORY) ==========
+
+const killerMoves = Array.from({ length: 32 }, () => [null, null]);
+const historyTable = new Map();
+
+function resetSearchHeuristics() {
+    for (let i = 0; i < 32; i++) {
+        killerMoves[i][0] = null;
+        killerMoves[i][1] = null;
+    }
+    historyTable.clear();
+}
+
+function recordKillerMove(depth, move) {
+    if (depth >= 32 || depth < 0) return;
+    const killers = killerMoves[depth];
+    if (killers[0] && killers[0].fromRow === move.fromRow && killers[0].fromCol === move.fromCol &&
+        killers[0].toRow === move.toRow && killers[0].toCol === move.toCol) return;
+    killers[1] = killers[0];
+    killers[0] = { fromRow: move.fromRow, fromCol: move.fromCol, toRow: move.toRow, toCol: move.toCol };
+}
+
+function recordHistory(move, depth) {
+    const moveKey = `${move.fromRow},${move.fromCol},${move.toRow},${move.toCol}`;
+    const current = historyTable.get(moveKey) || 0;
+    historyTable.set(moveKey, current + depth * depth);
+}
+
+function scoreMoveForOrdering(boardState, move, player, depth) {
+    const targetPiece = boardState[move.toRow][move.toCol];
+    const moveKey = `${move.fromRow},${move.fromCol},${move.toRow},${move.toCol}`;
+    
+    // 1. Captures: SEE-based score
+    if (targetPiece) {
+        const see = evaluateCaptureSafety(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol, player);
+        return see > 0 ? 100000 + see : (see < 0 ? -100000 + see : 0);
+    }
+    
+    // 2. Killer moves: quiet moves that caused cutoffs at this depth
+    if (depth >= 0 && depth < 32 && killerMoves[depth]) {
+        for (let i = 0; i < killerMoves[depth].length; i++) {
+            const killer = killerMoves[depth][i];
+            if (killer && killer.fromRow === move.fromRow && killer.fromCol === move.fromCol &&
+                killer.toRow === move.toRow && killer.toCol === move.toCol) {
+                return 90000 - i * 1000;
+            }
+        }
+    }
+    
+    // 3. History heuristic
+    return historyTable.get(moveKey) || 0;
 }
 
 // ========== PERSISTENT MEMORY TREE SYSTEM ==========
@@ -398,7 +451,6 @@ function isSquareAttackedByOpponent(boardState, row, col, player) {
 
 // ========== FULL RECURSIVE STATIC EXCHANGE EVALUATION ==========
 
-// Find the cheapest piece of a given color that can capture on the target square.
 function findCheapestAttacker(boardState, targetRow, targetCol, color) {
     let bestValue = Infinity;
     let bestAttacker = null;
@@ -419,9 +471,6 @@ function findCheapestAttacker(boardState, targetRow, targetCol, color) {
     return bestAttacker;
 }
 
-// Standard recursive SEE. Returns the net material swing from the perspective
-// of the side to move on this square. Uses the classic formula:
-//   seeValue = max(0, victimValue - seeRecursive(opponentOnSameSquare))
 function seeRecursive(boardState, targetRow, targetCol, sideToMove) {
     const attacker = findCheapestAttacker(boardState, targetRow, targetCol, sideToMove);
     if (!attacker) return 0;
@@ -429,7 +478,6 @@ function seeRecursive(boardState, targetRow, targetCol, sideToMove) {
     const victim = boardState[targetRow][targetCol];
     const victimValue = victim ? (PIECE_VALUES[victim] || 0) : 0;
     
-    // Make the capture
     const newBoard = makeTestMoveForPosition(boardState, attacker.row, attacker.col, targetRow, targetCol);
     if (!newBoard) return victimValue;
     
@@ -440,27 +488,20 @@ function seeRecursive(boardState, targetRow, targetCol, sideToMove) {
     return Math.max(0, net);
 }
 
-// Wrapper: returns the SEE for a specific move (net material swing for `player`).
 function evaluateCaptureSafety(boardState, fromRow, fromCol, toRow, toCol, player) {
     const victim = boardState[toRow][toCol];
     if (!victim) return 0;
     
     const victimValue = PIECE_VALUES[victim] || 0;
-    
-    // Make the capture
     const newBoard = makeTestMoveForPosition(boardState, fromRow, fromCol, toRow, toCol);
     if (!newBoard) return victimValue;
     
     const opponent = player === 'white' ? 'black' : 'white';
-    
-    // From opponent's perspective, what can they extract on this square?
     const opponentBest = seeRecursive(newBoard, toRow, toCol, opponent);
     
-    // Net for us: victim value minus whatever opponent extracts
     return victimValue - opponentBest;
 }
 
-// Kept for internal minimax compatibility — just calls the SEE wrapper
 function findLowestValueAttacker(boardState, targetRow, targetCol, attackerColor) {
     return findCheapestAttacker(boardState, targetRow, targetCol, attackerColor);
 }
@@ -1082,10 +1123,9 @@ function quiescenceSearch(boardState, alpha, beta, player, qDepth) {
     const opponent = player === 'white' ? 'black' : 'white';
     
     for (const move of captureMoves) {
-        const newBoard = makeTestMoveForPosition(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol);
-        // Only skip truly terrible captures (SEE < -100). Allow losing recaptures.
         const seeScore = evaluateCaptureSafety(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol, player);
-        if (seeScore < -100) continue;
+        if (seeScore < 0) continue;
+        const newBoard = makeTestMoveForPosition(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol);
         const score = -quiescenceSearch(newBoard, -beta, -alpha, opponent, qDepth - 1);
         if (score >= beta) return beta;
         if (score > alpha) alpha = score;
@@ -1109,24 +1149,9 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
         return 0;
     }
 
+    // Order moves by SEE, killers, and history
     moves.sort((a, b) => {
-        const targetA = boardState[a.toRow][a.toCol];
-        const targetB = boardState[b.toRow][b.toCol];
-        if (targetA && !targetB) return -1;
-        if (!targetA && targetB) return 1;
-        if (targetA && targetB) {
-            const valueA = PIECE_VALUES[targetA];
-            const valueB = PIECE_VALUES[targetB];
-            if (valueA !== valueB) return valueB - valueA;
-        }
-        const attackerA = boardState[a.fromRow][a.fromCol];
-        const attackerB = boardState[b.fromRow][b.fromCol];
-        const oppKing = findKing(boardState, player === 'white' ? 'black' : 'white');
-        const givesCheckA = oppKing ? canPieceAttackForPosition(attackerA, a.toRow, a.toCol, oppKing.row, oppKing.col, boardState) : false;
-        const givesCheckB = oppKing ? canPieceAttackForPosition(attackerB, b.toRow, b.toCol, oppKing.row, oppKing.col, boardState) : false;
-        if (givesCheckA && !givesCheckB) return -1;
-        if (!givesCheckA && givesCheckB) return 1;
-        return 0;
+        return scoreMoveForOrdering(boardState, b, player, depth) - scoreMoveForOrdering(boardState, a, player, depth);
     });
 
     if (isMaximizingPlayer) {
@@ -1136,7 +1161,13 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
 
         for (const move of moves) {
             const targetPiece = boardState[move.toRow][move.toCol];
-            // No hard filter — let SEE feed the eval naturally
+            
+            // Skip clearly bad captures at deeper plies — SEE negative = losing material
+            if (targetPiece && depth > 1) {
+                const see = evaluateCaptureSafety(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol, player);
+                if (see < -50) continue;
+            }
+            
             const newBoard = makeTestMoveForPosition(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol);
             const evaluation = minimaxWithRisk(newBoard, depth - 1, alpha, beta, false, nextPlayer, moveNumber + 1, trackWorstCase);
             let evalValue = typeof evaluation === 'object' ? evaluation.best : evaluation;
@@ -1152,7 +1183,13 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
                 worstCaseEval = Math.min(worstCaseEval, worstVal);
             }
             alpha = Math.max(alpha, evalValue);
-            if (beta <= alpha) break;
+            if (beta <= alpha) {
+                if (!targetPiece) {
+                    recordKillerMove(depth, move);
+                    recordHistory(move, depth);
+                }
+                break;
+            }
         }
         return trackWorstCase ? { best: maxEval, worst: worstCaseEval } : maxEval;
     } else {
@@ -1162,6 +1199,12 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
 
         for (const move of moves) {
             const targetPiece = boardState[move.toRow][move.toCol];
+            
+            if (targetPiece && depth > 1) {
+                const see = evaluateCaptureSafety(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol, player);
+                if (see < -50) continue;
+            }
+            
             const newBoard = makeTestMoveForPosition(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol);
             const evaluation = minimaxWithRisk(newBoard, depth - 1, alpha, beta, true, nextPlayer, moveNumber + 1, trackWorstCase);
             let evalValue = typeof evaluation === 'object' ? evaluation.best : evaluation;
@@ -1177,7 +1220,13 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
                 worstCaseEval = Math.max(worstCaseEval, worstVal);
             }
             beta = Math.min(beta, evalValue);
-            if (beta <= alpha) break;
+            if (beta <= alpha) {
+                if (!targetPiece) {
+                    recordKillerMove(depth, move);
+                    recordHistory(move, depth);
+                }
+                break;
+            }
         }
         return trackWorstCase ? { best: minEval, worst: worstCaseEval } : minEval;
     }
@@ -1219,6 +1268,7 @@ let riskAssessor = new RiskAssessment();
 
 function findBestMoveWithRiskAssessment() {
     setSearchPrefix(moveHistory.join("|"));
+    resetSearchHeuristics();
     
     const allMoves = getAllPossibleMoves(currentPlayer);
     if (allMoves.length === 0) return null;
@@ -1239,6 +1289,20 @@ function findBestMoveWithRiskAssessment() {
     
     console.log(`🔍 ${currentPlayer.toUpperCase()} AI searching at depth ${searchDepth}${isEndgame ? ' (endgame)' : ''}`);
     const searchStartTime = performance.now();
+    
+    // Order root moves by SEE before searching them
+    allMoves.sort((a, b) => {
+        const targetA = board[a.toRow][a.toCol];
+        const targetB = board[b.toRow][b.toCol];
+        if (targetA && !targetB) return -1;
+        if (!targetA && targetB) return 1;
+        if (targetA && targetB) {
+            const seeA = evaluateCaptureSafety(board, a.fromRow, a.fromCol, a.toRow, a.toCol, currentPlayer);
+            const seeB = evaluateCaptureSafety(board, b.fromRow, b.fromCol, b.toRow, b.toCol, currentPlayer);
+            return seeB - seeA;
+        }
+        return 0;
+    });
     
     const evaluatedMoves = [];
     
@@ -1796,6 +1860,7 @@ window.addEventListener('load', function() {
 
 function newGame() {
     clearAllCaches();
+    resetSearchHeuristics();
     
     board = [
         ['♜', '♞', '♝', '♛', '♚', '♝', '♞', '♜'],
@@ -1888,6 +1953,7 @@ function changeGameMode() {
 function clearMemory() {
     if (confirm('Clear AI memory?')) {
         clearAllCaches();
+        resetSearchHeuristics();
         if (moveTree) moveTree.clear();
         transpositionTable.clear();
         updateAIStats();
@@ -1904,4 +1970,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - Full SEE + Recapture Fix`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - Killer moves + History heuristic active`);
