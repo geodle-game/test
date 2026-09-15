@@ -1,6 +1,6 @@
 // chess-game.js
 // Enhanced chess game with dynamic piece activity + threat-based evaluation
-// VERSION: 2.4.2 - Killer Moves + History Heuristic + SEE Ordering
+// VERSION: 2.4.2 - Killer Moves + History + Pawn Shield + Hanging Pieces
 // COMPATIBLE WITH: chess-ai-database.js (v2.0) and chess-game-database.js (v1.1)
 
 const GAME_VERSION = "2.4.2";
@@ -18,6 +18,8 @@ const reachableCache = new Map();
 const kingDangerCache = new Map();
 const promotionCache = new Map();
 const mateCache = new Map();
+const pawnShieldCache = new Map();
+const hangingCache = new Map();
 
 const CACHE_LIMIT = 500000;
 
@@ -35,7 +37,8 @@ function pruneCachesToLine(actualLine) {
     let pruned = 0;
     
     const caches = [evalCache, activityCache, threatCache, attackCache, 
-                    reachableCache, kingDangerCache, promotionCache, mateCache];
+                    reachableCache, kingDangerCache, promotionCache, mateCache,
+                    pawnShieldCache, hangingCache];
     
     for (const cache of caches) {
         const toDelete = [];
@@ -60,6 +63,8 @@ function clearAllCaches() {
     kingDangerCache.clear();
     promotionCache.clear();
     mateCache.clear();
+    pawnShieldCache.clear();
+    hangingCache.clear();
     LAYER_HITS = 0;
     LAYER_MISSES = 0;
     currentSearchPrefix = "";
@@ -123,13 +128,11 @@ function scoreMoveForOrdering(boardState, move, player, depth) {
     const targetPiece = boardState[move.toRow][move.toCol];
     const moveKey = `${move.fromRow},${move.fromCol},${move.toRow},${move.toCol}`;
     
-    // 1. Captures: SEE-based score
     if (targetPiece) {
         const see = evaluateCaptureSafety(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol, player);
         return see > 0 ? 100000 + see : (see < 0 ? -100000 + see : 0);
     }
     
-    // 2. Killer moves: quiet moves that caused cutoffs at this depth
     if (depth >= 0 && depth < 32 && killerMoves[depth]) {
         for (let i = 0; i < killerMoves[depth].length; i++) {
             const killer = killerMoves[depth][i];
@@ -140,7 +143,6 @@ function scoreMoveForOrdering(boardState, move, player, depth) {
         }
     }
     
-    // 3. History heuristic
     return historyTable.get(moveKey) || 0;
 }
 
@@ -537,6 +539,85 @@ function getHungPieceValue(boardState, fromRow, fromCol, toRow, toCol, player) {
     return maxHungValue;
 }
 
+// ========== PAWN SHIELD EVALUATION ==========
+
+function evaluatePawnShield(boardState, player) {
+    const key = boardToHash(boardState) + "|shield|" + player;
+    const cached = cacheGet(pawnShieldCache, key);
+    if (cached !== undefined) return cached;
+    
+    const king = findKing(boardState, player);
+    if (!king) { cacheSet(pawnShieldCache, key, 0); return 0; }
+    
+    const pawn = player === 'white' ? '♙' : '♟';
+    const direction = player === 'white' ? -1 : 1;
+    const homeRow = player === 'white' ? 6 : 1;
+    
+    const kingFile = king.col;
+    const shieldFiles = [kingFile - 1, kingFile, kingFile + 1].filter(f => f >= 0 && f <= 7);
+    
+    let shieldScore = 0;
+    let pawnsInShield = 0;
+    
+    for (const file of shieldFiles) {
+        let foundPawn = false;
+        for (let r = king.row + direction; r >= 0 && r <= 7; r += direction) {
+            if (boardState[r][file] === pawn) {
+                foundPawn = true;
+                const distance = Math.abs(r - homeRow);
+                shieldScore += 15 - distance * 5;
+                break;
+            }
+            if (boardState[r][file]) break;
+        }
+        if (foundPawn) pawnsInShield++;
+    }
+    
+    if (pawnsInShield < shieldFiles.length) {
+        shieldScore -= (shieldFiles.length - pawnsInShield) * 25;
+    }
+    
+    cacheSet(pawnShieldCache, key, shieldScore);
+    return shieldScore;
+}
+
+// ========== HANGING PIECES EVALUATION ==========
+
+function evaluateHangingPieces(boardState, player) {
+    const key = boardToHash(boardState) + "|hang|" + player;
+    const cached = cacheGet(hangingCache, key);
+    if (cached !== undefined) return cached;
+    
+    const opponent = player === 'white' ? 'black' : 'white';
+    let hangingScore = 0;
+    
+    for (let row = 0; row < 8; row++) {
+        for (let col = 0; col < 8; col++) {
+            const piece = boardState[row][col];
+            if (!piece || !isPlayerPieceForPosition(piece, player)) continue;
+            if (piece === '♔' || piece === '♚') continue;
+            
+            if (!isSquareAttackedForPosition(boardState, row, col, opponent)) continue;
+            
+            const pieceValue = PIECE_VALUES[piece] || 0;
+            const defended = isPieceDefended(boardState, row, col, player);
+            
+            const attacker = findCheapestAttacker(boardState, row, col, opponent);
+            if (!attacker) continue;
+            
+            if (!defended) {
+                hangingScore -= pieceValue;
+            } else if (attacker.value < pieceValue) {
+                const loss = pieceValue - attacker.value;
+                hangingScore -= loss * 0.5;
+            }
+        }
+    }
+    
+    cacheSet(hangingCache, key, hangingScore);
+    return hangingScore;
+}
+
 // ========== DYNAMIC PIECE ACTIVITY EVALUATION ==========
 
 function evaluateAllPieceActivity(boardState, player) {
@@ -880,6 +961,7 @@ function evaluatePositionForSearch(boardState, player, moveNumber) {
     let evaluation = 0;
     const opponent = player === 'white' ? 'black' : 'white';
     
+    // 1. Material
     for (let row = 0; row < 8; row++) {
         for (let col = 0; col < 8; col++) {
             const piece = boardState[row] && boardState[row][col];
@@ -890,14 +972,33 @@ function evaluatePositionForSearch(boardState, player, moveNumber) {
         }
     }
     
+    // 2. Piece activity
     evaluation += evaluateAllPieceActivity(boardState, 'white');
     evaluation -= evaluateAllPieceActivity(boardState, 'black');
+    
+    // 3. Threats
     evaluation -= evaluateOpponentThreats(boardState, player) * 0.5;
-    evaluation -= evaluateKingDanger(boardState, player) * 0.3;
-    evaluation += evaluateKingDanger(boardState, opponent) * 0.3;
+    
+    // 4. King safety — bumped weight from 0.3 to 0.5
+    evaluation -= evaluateKingDanger(boardState, player) * 0.5;
+    evaluation += evaluateKingDanger(boardState, opponent) * 0.5;
+    
+    // 5. Pawn shield — directly penalizes f6/h6-style moves
+    evaluation += evaluatePawnShield(boardState, player);
+    evaluation -= evaluatePawnShield(boardState, opponent);
+    
+    // 6. Hanging pieces — detects when our pieces are under threat
+    evaluation += evaluateHangingPieces(boardState, player);
+    evaluation -= evaluateHangingPieces(boardState, opponent);
+    
+    // 7. Promotion urgency
     evaluation += evaluatePromotionThreats(boardState, player);
     evaluation -= evaluatePromotionThreats(boardState, opponent);
+    
+    // 8. Endgame check penalty
     evaluation += getEndgameCheckPenalty(boardState, player, moveHistory);
+    
+    // 9. Checkmate bonus
     evaluation += evaluateCheckmatePatterns(boardState, player);
     
     cacheSet(evalCache, key, evaluation);
@@ -1149,7 +1250,6 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
         return 0;
     }
 
-    // Order moves by SEE, killers, and history
     moves.sort((a, b) => {
         return scoreMoveForOrdering(boardState, b, player, depth) - scoreMoveForOrdering(boardState, a, player, depth);
     });
@@ -1162,7 +1262,6 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
         for (const move of moves) {
             const targetPiece = boardState[move.toRow][move.toCol];
             
-            // Skip clearly bad captures at deeper plies — SEE negative = losing material
             if (targetPiece && depth > 1) {
                 const see = evaluateCaptureSafety(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol, player);
                 if (see < -50) continue;
@@ -1290,7 +1389,6 @@ function findBestMoveWithRiskAssessment() {
     console.log(`🔍 ${currentPlayer.toUpperCase()} AI searching at depth ${searchDepth}${isEndgame ? ' (endgame)' : ''}`);
     const searchStartTime = performance.now();
     
-    // Order root moves by SEE before searching them
     allMoves.sort((a, b) => {
         const targetA = board[a.toRow][a.toCol];
         const targetB = board[b.toRow][b.toCol];
@@ -1970,4 +2068,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - Killer moves + History heuristic active`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - Pawn shield + Hanging pieces + Killer moves active`);
