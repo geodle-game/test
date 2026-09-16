@@ -1,9 +1,9 @@
 // chess-game.js
 // Enhanced chess game with dynamic piece activity + threat-based evaluation
-// VERSION: 2.4.2 - Fixed root sign convention (AI now plays both colors correctly)
+// VERSION: 2.4.3 - Branch-aware cache pruning
 // COMPATIBLE WITH: chess-ai-database.js (v2.0) and chess-game-database.js (v1.1)
 
-const GAME_VERSION = "2.4.2";
+const GAME_VERSION = "2.4.3";
 
 // ========== GAME DATABASES ==========
 let openingBook = null;
@@ -26,10 +26,39 @@ const CACHE_LIMIT = 500000;
 let LAYER_HITS = 0;
 let LAYER_MISSES = 0;
 
+// The game line at the start of the search (used by cacheGet to validate entries).
 let currentSearchPrefix = "";
+
+// The branch currently being explored inside the search. Gets extended at
+// every recursion by the move played. Entries are tagged with this so that
+// pruneCachesToLine can delete branches that diverged from the real game.
+let currentBranchPrefix = "";
 
 function setSearchPrefix(prefix) {
     currentSearchPrefix = prefix;
+    currentBranchPrefix = prefix;
+}
+
+// Push a move onto the current branch, returning the previous value so it
+// can be restored after the recursive call returns.
+function pushBranch(moveStr) {
+    const saved = currentBranchPrefix;
+    currentBranchPrefix = currentBranchPrefix ? currentBranchPrefix + "|" + moveStr : moveStr;
+    return saved;
+}
+
+function restoreBranch(saved) {
+    currentBranchPrefix = saved;
+}
+
+// Keep an entry only if its stored branch shares a prefix relationship with
+// the actual game line. That is: either the game line continues from where
+// the entry was evaluated, or the entry extends the game line (a deeper line
+// the search explored from a position we actually reached).
+function branchesCompatible(entryPrefix, linePrefix) {
+    if (!entryPrefix) return true;
+    if (!linePrefix) return true;
+    return linePrefix.startsWith(entryPrefix) || entryPrefix.startsWith(linePrefix);
 }
 
 function pruneCachesToLine(actualLine) {
@@ -44,8 +73,7 @@ function pruneCachesToLine(actualLine) {
         const toDelete = [];
         for (const [key, entry] of cache) {
             const entryPrefix = entry.prefix || "";
-            const keep = linePrefix.startsWith(entryPrefix) || entryPrefix.startsWith(linePrefix);
-            if (!keep) toDelete.push(key);
+            if (!branchesCompatible(entryPrefix, linePrefix)) toDelete.push(key);
         }
         for (const key of toDelete) cache.delete(key);
         pruned += toDelete.length;
@@ -68,22 +96,20 @@ function clearAllCaches() {
     LAYER_HITS = 0;
     LAYER_MISSES = 0;
     currentSearchPrefix = "";
+    currentBranchPrefix = "";
 }
 
 function cacheGet(cache, key) {
     const entry = cache.get(key);
     if (entry === undefined) return undefined;
-    const p = entry.prefix || "";
-    const line = currentSearchPrefix;
-    if (line.startsWith(p) || p.startsWith(line)) {
-        return entry.value;
-    }
-    return undefined;
+    // The position hash is part of the key, so if it's stored for this hash,
+    // it's correct for this position regardless of which branch reached it.
+    return entry.value;
 }
 
 function cacheSet(cache, key, value) {
     if (cache.size > CACHE_LIMIT) cache.clear();
-    cache.set(key, { value, prefix: currentSearchPrefix });
+    cache.set(key, { value, prefix: currentBranchPrefix });
 }
 
 function boardToHash(boardState) {
@@ -949,9 +975,6 @@ function evaluatePromotionThreats(boardState, player) {
 }
 
 // ========== MAIN EVALUATION ==========
-// IMPORTANT: This evaluation is ALWAYS from White's perspective.
-// Positive = good for White. Negative = good for Black.
-// The search treats White as the maximizing player and Black as the minimizing player.
 
 function evaluatePositionForSearch(boardState, player, moveNumber) {
     if (!boardState) return 0;
@@ -964,7 +987,6 @@ function evaluatePositionForSearch(boardState, player, moveNumber) {
     let evaluation = 0;
     const opponent = player === 'white' ? 'black' : 'white';
     
-    // Material — always positive for White
     for (let row = 0; row < 8; row++) {
         for (let col = 0; col < 8; col++) {
             const piece = boardState[row] && boardState[row][col];
@@ -975,7 +997,6 @@ function evaluatePositionForSearch(boardState, player, moveNumber) {
         }
     }
     
-    // All terms are added with White-positive sign
     evaluation += evaluateAllPieceActivity(boardState, 'white');
     evaluation -= evaluateAllPieceActivity(boardState, 'black');
     evaluation -= evaluateOpponentThreats(boardState, 'white') * 0.5;
@@ -1230,8 +1251,11 @@ function quiescenceSearch(boardState, alpha, beta, player, qDepth) {
             const seeScore = evaluateCaptureSafety(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol, player);
             if (seeScore < 0) continue;
         }
+        const moveStr = toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol);
+        const savedBranch = pushBranch(moveStr);
         const newBoard = makeTestMoveForPosition(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol);
         const score = -quiescenceSearch(newBoard, -beta, -alpha, opponent, qDepth - 1);
+        restoreBranch(savedBranch);
         if (score >= beta) return beta;
         if (score > alpha) alpha = score;
     }
@@ -1290,8 +1314,11 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
                 }
             }
             
+            const moveStr = toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol);
+            const savedBranch = pushBranch(moveStr);
             const newBoard = makeTestMoveForPosition(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol);
             const evaluation = minimaxWithRisk(newBoard, depth - 1, alpha, beta, false, nextPlayer, moveNumber + 1, trackWorstCase);
+            restoreBranch(savedBranch);
             let evalValue = typeof evaluation === 'object' ? evaluation.best : evaluation;
             
             if (targetPiece) {
@@ -1331,8 +1358,11 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
                 }
             }
             
+            const moveStr = toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol);
+            const savedBranch = pushBranch(moveStr);
             const newBoard = makeTestMoveForPosition(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol);
             const evaluation = minimaxWithRisk(newBoard, depth - 1, alpha, beta, true, nextPlayer, moveNumber + 1, trackWorstCase);
+            restoreBranch(savedBranch);
             let evalValue = typeof evaluation === 'object' ? evaluation.best : evaluation;
             
             if (targetPiece) {
@@ -1400,10 +1430,8 @@ function findBestMoveWithRiskAssessment() {
     if (allMoves.length === 0) return null;
     
     const opponentColor = currentPlayer === 'white' ? 'black' : 'white';
-    // KEY: the eval is White-positive, so White is the maximizing side.
     const opponentIsMaximizing = (opponentColor === 'white');
     
-    // Root mate-in-1 shortcut
     for (const move of allMoves) {
         const newBoard = makeTestMoveForPosition(board, move.fromRow, move.fromCol, move.toRow, move.toCol);
         if (newBoard && isKingInCheckForPosition(newBoard, opponentColor)) {
@@ -1453,7 +1481,6 @@ function findBestMoveWithRiskAssessment() {
             if (isEndlessCheck(testHistory, currentPlayer)) continue;
         }
         
-        // Don't hang a piece worth much more than what we capture.
         const targetPieceForHungCheck = board[move.toRow][move.toCol];
         const targetValueForHungCheck = targetPieceForHungCheck ? (PIECE_VALUES[targetPieceForHungCheck] || 0) : 0;
         const hungValue = getHungPieceValue(board, move.fromRow, move.fromCol, move.toRow, move.toCol, currentPlayer);
@@ -1475,12 +1502,15 @@ function findBestMoveWithRiskAssessment() {
                 depth: cachedResult.depth
             });
         } else {
+            const moveStr = toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol);
+            const savedBranch = pushBranch(moveStr);
             const newBoard = makeTestMoveForPosition(board, move.fromRow, move.fromCol, move.toRow, move.toCol);
             
             const bestResult = minimaxWithRisk(newBoard, searchDepth - 1, -Infinity, Infinity, opponentIsMaximizing, 
                 opponentColor, moveCount + 1, false);
             const worstResult = minimaxWithRisk(newBoard, searchDepth - 1, -Infinity, Infinity, opponentIsMaximizing, 
                 opponentColor, moveCount + 1, true);
+            restoreBranch(savedBranch);
             
             const worstCase = typeof worstResult === 'object' ? worstResult.best : worstResult;
             let bestCase = typeof bestResult === 'object' ? bestResult.best : bestResult;
@@ -1501,15 +1531,17 @@ function findBestMoveWithRiskAssessment() {
     
     if (evaluatedMoves.length === 0) {
         for (const move of allMoves) {
+            const moveStr = toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol);
+            const savedBranch = pushBranch(moveStr);
             const newBoard = makeTestMoveForPosition(board, move.fromRow, move.fromCol, move.toRow, move.toCol);
             const bestResult = minimaxWithRisk(newBoard, searchDepth - 1, -Infinity, Infinity, opponentIsMaximizing, 
                 opponentColor, moveCount + 1, false);
+            restoreBranch(savedBranch);
             const bestCase = typeof bestResult === 'object' ? bestResult.best : bestResult;
             evaluatedMoves.push({ move, bestCase, worstCase: bestCase - 100, depth: searchDepth });
         }
     }
     
-    // Eval is White-positive. White AI wants the max, Black AI wants the min.
     if (currentPlayer === 'white') {
         evaluatedMoves.sort((a, b) => b.bestCase - a.bestCase);
     } else {
@@ -1952,7 +1984,7 @@ function updateAIStats() {
         winRate = Math.round((stats.whiteWins / stats.totalGames) * 100);
     }
     winRateElement.textContent = winRate;
-    if (difficultyElement) difficultyElement.textContent = `PMTS v2.4.2`;
+    if (difficultyElement) difficultyElement.textContent = `PMTS v2.4.3`;
     if (versionElement) versionElement.textContent = `v${GAME_VERSION}`;
 }
 
@@ -2092,7 +2124,7 @@ function changeGameMode() {
     if (!gameModeSelect || !gameModeDisplay) return;
     gameMode = gameModeSelect.value;
     if (gameMode === 'ai') {
-        gameModeDisplay.textContent = 'vs AI (v2.4.2)';
+        gameModeDisplay.textContent = 'vs AI (v2.4.3)';
         if (aiInfo) aiInfo.style.display = 'block';
         if (currentPlayer === aiPlayer && !gameOver) setTimeout(makeAIMove, 500);
     } else {
@@ -2121,4 +2153,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - Fixed root sign convention`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - Branch-aware pruning active`);
