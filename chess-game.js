@@ -1,6 +1,6 @@
 // chess-game.js
 // Enhanced chess game with dynamic piece activity + threat-based evaluation
-// VERSION: 2.4.3 - Branch-aware cache pruning + in-place king check
+// VERSION: 2.4.3 - King exempt from SEE pruning + hang guard + SEE king exclusion
 // COMPATIBLE WITH: chess-ai-database.js (v2.0) and chess-game-database.js (v1.1)
 
 const GAME_VERSION = "2.4.3";
@@ -466,6 +466,9 @@ function isSquareAttackedByOpponent(boardState, row, col, player) {
 
 // ========== FULL RECURSIVE STATIC EXCHANGE EVALUATION ==========
 
+// Kings are excluded from SEE recapture simulation. SEE can't model king legality
+// (pins, discovered checks), so including the king leads to false "you'll lose your
+// 20000-value king" penalties. King moves are validated separately by wouldKingBeInCheckAfter.
 function findCheapestAttacker(boardState, targetRow, targetCol, color) {
     let bestValue = Infinity;
     let bestAttacker = null;
@@ -474,6 +477,7 @@ function findCheapestAttacker(boardState, targetRow, targetCol, color) {
         for (let col = 0; col < 8; col++) {
             const piece = boardState[row] && boardState[row][col];
             if (!piece || !isPlayerPieceForPosition(piece, color)) continue;
+            if (piece === '♔' || piece === '♚') continue;  // Kings don't recapture in SEE
             if (canPieceAttackForPosition(piece, row, col, targetRow, targetCol, boardState)) {
                 const value = PIECE_VALUES[piece] || 0;
                 if (value < bestValue) {
@@ -525,8 +529,10 @@ function getHungPieceValue(boardState, fromRow, fromCol, toRow, toCol, player) {
     const newBoard = makeTestMoveForPosition(boardState, fromRow, fromCol, toRow, toCol);
     if (!newBoard) return 0;
     
+    // Only consider the moved piece, and never treat the king as "hanging"
+    // (king moves are validated by wouldKingBeInCheckAfter).
     const movedPiece = newBoard[toRow][toCol];
-    if (movedPiece) {
+    if (movedPiece && movedPiece !== '♔' && movedPiece !== '♚') {
         const movedValue = PIECE_VALUES[movedPiece] || 0;
         if (movedValue >= 300) {
             const attacked = isSquareAttackedByOpponent(newBoard, toRow, toCol, player);
@@ -535,21 +541,7 @@ function getHungPieceValue(boardState, fromRow, fromCol, toRow, toCol, player) {
         }
     }
     
-    let maxHungValue = 0;
-    for (let r = 0; r < 8; r++) {
-        for (let c = 0; c < 8; c++) {
-            const p = newBoard[r] && newBoard[r][c];
-            if (p && isPlayerPieceForPosition(p, player) && p !== '♔' && p !== '♚') {
-                const val = PIECE_VALUES[p] || 0;
-                if (val >= 300) {
-                    const attacked = isSquareAttackedByOpponent(newBoard, r, c, player);
-                    const defended = isPieceDefended(newBoard, r, c, player);
-                    if (attacked && !defended && val > maxHungValue) maxHungValue = val;
-                }
-            }
-        }
-    }
-    return maxHungValue;
+    return 0;
 }
 
 // ========== PAWN SHIELD EVALUATION ==========
@@ -1099,8 +1091,6 @@ function isKingInCheckForPosition(boardState, player) {
     return isSquareAttackedForPosition(boardState, kingRow, kingCol, attackerColor);
 }
 
-// In-place king-check test: mutate board, check, restore. No allocation.
-// Safe because the caller never uses boardState between the mutation and restore.
 function wouldKingBeInCheckAfter(boardState, fromRow, fromCol, toRow, toCol, player) {
     const movingPiece = boardState[fromRow][fromCol];
     const capturedPiece = boardState[toRow][toCol];
@@ -1246,7 +1236,11 @@ function quiescenceSearch(boardState, alpha, beta, player, qDepth) {
     const opponent = player === 'white' ? 'black' : 'white';
     
     for (const move of candidateMoves) {
-        if (!inCheck) {
+        // SEE pruning for non-king captures only. King moves are validated by
+        // the legality filter and shouldn't be penalized by SEE.
+        const movingPiece = boardState[move.fromRow][move.fromCol];
+        const isKingMove = (movingPiece === '♔' || movingPiece === '♚');
+        if (!inCheck && !isKingMove) {
             const seeScore = evaluateCaptureSafety(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol, player);
             if (seeScore < 0) continue;
         }
@@ -1303,8 +1297,11 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
 
         for (const move of moves) {
             const targetPiece = boardState[move.toRow][move.toCol];
+            const movingPiece = boardState[move.fromRow][move.fromCol];
+            const isKingMove = (movingPiece === '♔' || movingPiece === '♚');
             
-            if (targetPiece) {
+            // SEE pruning: non-king captures only
+            if (targetPiece && !isKingMove) {
                 const newBoardTest = makeTestMoveForPosition(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol);
                 const givesCheck = newBoardTest && isKingInCheckForPosition(newBoardTest, nextPlayer);
                 if (!givesCheck) {
@@ -1320,7 +1317,7 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
             restoreBranch(savedBranch);
             let evalValue = typeof evaluation === 'object' ? evaluation.best : evaluation;
             
-            if (targetPiece) {
+            if (targetPiece && !isKingMove) {
                 const captureSafety = evaluateCaptureSafety(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol, player);
                 evalValue += captureSafety;
             }
@@ -1347,8 +1344,11 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
 
         for (const move of moves) {
             const targetPiece = boardState[move.toRow][move.toCol];
+            const movingPiece = boardState[move.fromRow][move.fromCol];
+            const isKingMove = (movingPiece === '♔' || movingPiece === '♚');
             
-            if (targetPiece) {
+            // SEE pruning: non-king captures only
+            if (targetPiece && !isKingMove) {
                 const newBoardTest = makeTestMoveForPosition(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol);
                 const givesCheck = newBoardTest && isKingInCheckForPosition(newBoardTest, nextPlayer);
                 if (!givesCheck) {
@@ -1364,7 +1364,7 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
             restoreBranch(savedBranch);
             let evalValue = typeof evaluation === 'object' ? evaluation.best : evaluation;
             
-            if (targetPiece) {
+            if (targetPiece && !isKingMove) {
                 const captureSafety = evaluateCaptureSafety(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol, player);
                 evalValue -= captureSafety;
             }
@@ -1480,12 +1480,18 @@ function findBestMoveWithRiskAssessment() {
             if (isEndlessCheck(testHistory, currentPlayer)) continue;
         }
         
-        const targetPieceForHungCheck = board[move.toRow][move.toCol];
-        const targetValueForHungCheck = targetPieceForHungCheck ? (PIECE_VALUES[targetPieceForHungCheck] || 0) : 0;
-        const hungValue = getHungPieceValue(board, move.fromRow, move.fromCol, move.toRow, move.toCol, currentPlayer);
-        if (hungValue > targetValueForHungCheck + 200) {
-            console.log(`⏭️ Skipping ${toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol)} (hangs ${hungValue})`);
-            continue;
+        // Hang guard: skip moves that hang a piece worth much more than they capture.
+        // King moves are exempt — legality already verified by wouldKingBeInCheckAfter.
+        const movingPieceRoot = board[move.fromRow][move.fromCol];
+        const isKingMoveRoot = (movingPieceRoot === '♔' || movingPieceRoot === '♚');
+        if (!isKingMoveRoot) {
+            const targetPieceForHungCheck = board[move.toRow][move.toCol];
+            const targetValueForHungCheck = targetPieceForHungCheck ? (PIECE_VALUES[targetPieceForHungCheck] || 0) : 0;
+            const hungValue = getHungPieceValue(board, move.fromRow, move.fromCol, move.toRow, move.toCol, currentPlayer);
+            if (hungValue > targetValueForHungCheck + 200) {
+                console.log(`⏭️ Skipping ${toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol)} (hangs ${hungValue})`);
+                continue;
+            }
         }
         
         let cachedResult = null;
@@ -1515,7 +1521,7 @@ function findBestMoveWithRiskAssessment() {
             let bestCase = typeof bestResult === 'object' ? bestResult.best : bestResult;
             
             const targetPiece = board[move.toRow][move.toCol];
-            if (targetPiece) {
+            if (targetPiece && !isKingMoveRoot) {
                 const captureSafety = evaluateCaptureSafety(board, move.fromRow, move.fromCol, move.toRow, move.toCol, currentPlayer);
                 bestCase += captureSafety;
             }
@@ -2152,4 +2158,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - Branch pruning + in-place king check`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - King SEE exemption active`);
