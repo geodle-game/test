@@ -1250,8 +1250,23 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
     const inCheck = isKingInCheckForPosition(boardState, player);
     
     if (depth <= 0 && !inCheck) {
-        // Only fall to quiescence if NOT in check — otherwise we might miss mate
-        return quiescenceSearch(boardState, alpha, beta, player, SEARCH_CONFIG.quiescenceDepth);
+        // Mate-in-1 guard: before falling to quiescence, check if the side to
+        // move has an immediate mate. If so, force a 1-ply extension so the
+        // search sees it. Without this, a quiet mating move (non-capture) would
+        // be invisible to quiescence (which only looks at captures).
+        let hasMateIn1 = false;
+        const nextSide = player === 'white' ? 'black' : 'white';
+        for (const m of moves) {
+            const nb = makeTestMoveForPosition(boardState, m.fromRow, m.fromCol, m.toRow, m.toCol);
+            if (nb && isKingInCheckForPosition(nb, nextSide)) {
+                const responses = getAllPossibleMovesForPosition(nb, nextSide);
+                if (responses.length === 0) { hasMateIn1 = true; break; }
+            }
+        }
+        if (!hasMateIn1) {
+            return quiescenceSearch(boardState, alpha, beta, player, SEARCH_CONFIG.quiescenceDepth);
+        }
+        // Otherwise fall through and search normally with depth 1
     }
     
     // Check extension: if in check at depth exhaustion, force at least depth 1
@@ -2102,4 +2117,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - Pruning fixed`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - Pruning fixed, mate-in-1 guard active`);
