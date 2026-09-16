@@ -1,9 +1,9 @@
 // chess-game.js
 // Enhanced chess game with dynamic piece activity + threat-based evaluation
-// VERSION: 2.4.3 - King exempt from SEE pruning + hang guard + SEE king exclusion
+// VERSION: 2.4.4 - Optimized move generation (pattern-based iteration)
 // COMPATIBLE WITH: chess-ai-database.js (v2.0) and chess-game-database.js (v1.1)
 
-const GAME_VERSION = "2.4.3";
+const GAME_VERSION = "2.4.4";
 
 // ========== GAME DATABASES ==========
 let openingBook = null;
@@ -477,7 +477,7 @@ function findCheapestAttacker(boardState, targetRow, targetCol, color) {
         for (let col = 0; col < 8; col++) {
             const piece = boardState[row] && boardState[row][col];
             if (!piece || !isPlayerPieceForPosition(piece, color)) continue;
-            if (piece === '♔' || piece === '♚') continue;  // Kings don't recapture in SEE
+            if (piece === '♔' || piece === '♚') continue;
             if (canPieceAttackForPosition(piece, row, col, targetRow, targetCol, boardState)) {
                 const value = PIECE_VALUES[piece] || 0;
                 if (value < bestValue) {
@@ -1162,18 +1162,98 @@ function makeTestMoveForPosition(boardState, fromRow, fromCol, toRow, toCol) {
     return newBoard;
 }
 
+// Optimized move generation: iterate only the pattern-valid target squares per piece
+// instead of scanning all 64 squares. Same legal moves generated (isValidMoveForPosition
+// still runs on every pattern-valid target), just fewer wasted iterations.
 function getAllPossibleMovesForPosition(boardState, player) {
     if (!boardState) return [];
     const moves = [];
+    
     for (let fromRow = 0; fromRow < 8; fromRow++) {
         for (let fromCol = 0; fromCol < 8; fromCol++) {
             const piece = boardState[fromRow] && boardState[fromRow][fromCol];
-            if (piece && isPlayerPieceForPosition(piece, player)) {
-                for (let toRow = 0; toRow < 8; toRow++) {
-                    for (let toCol = 0; toCol < 8; toCol++) {
-                        if (isValidMoveForPosition(boardState, fromRow, fromCol, toRow, toCol, player)) {
-                            moves.push({ fromRow, fromCol, toRow, toCol });
+            if (!piece || !isPlayerPieceForPosition(piece, player)) continue;
+            
+            const pieceCode = pieceMap[piece];
+            if (!pieceCode) continue;
+            const lower = pieceCode.toLowerCase();
+            
+            if (lower === 'p') {
+                const direction = pieceCode === 'P' ? -1 : 1;
+                const startRow = pieceCode === 'P' ? 6 : 1;
+                
+                // One square forward
+                const oneR = fromRow + direction;
+                if (isInBounds(oneR, fromCol) && !boardState[oneR][fromCol]) {
+                    if (isValidMoveForPosition(boardState, fromRow, fromCol, oneR, fromCol, player)) {
+                        moves.push({ fromRow, fromCol, toRow: oneR, toCol: fromCol });
+                    }
+                    // Two squares forward (only from starting row, only if intermediate empty)
+                    if (fromRow === startRow) {
+                        const twoR = fromRow + 2 * direction;
+                        if (isInBounds(twoR, fromCol) && !boardState[twoR][fromCol]) {
+                            if (isValidMoveForPosition(boardState, fromRow, fromCol, twoR, fromCol, player)) {
+                                moves.push({ fromRow, fromCol, toRow: twoR, toCol: fromCol });
+                            }
                         }
+                    }
+                }
+                
+                // Diagonal captures
+                for (const dc of [-1, 1]) {
+                    const capR = fromRow + direction;
+                    const capC = fromCol + dc;
+                    if (!isInBounds(capR, capC)) continue;
+                    const target = boardState[capR][capC];
+                    if (target && !isPlayerPieceForPosition(target, player)) {
+                        if (isValidMoveForPosition(boardState, fromRow, fromCol, capR, capC, player)) {
+                            moves.push({ fromRow, fromCol, toRow: capR, toCol: capC });
+                        }
+                    }
+                }
+            } else if (lower === 'n') {
+                const offsets = [[1,2],[2,1],[-1,2],[-2,1],[1,-2],[2,-1],[-1,-2],[-2,-1]];
+                for (const [dx, dy] of offsets) {
+                    const r = fromRow + dy;
+                    const c = fromCol + dx;
+                    if (!isInBounds(r, c)) continue;
+                    const target = boardState[r][c];
+                    if (target && isPlayerPieceForPosition(target, player)) continue;
+                    if (isValidMoveForPosition(boardState, fromRow, fromCol, r, c, player)) {
+                        moves.push({ fromRow, fromCol, toRow: r, toCol: c });
+                    }
+                }
+            } else if (lower === 'k') {
+                const offsets = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]];
+                for (const [dx, dy] of offsets) {
+                    const r = fromRow + dy;
+                    const c = fromCol + dx;
+                    if (!isInBounds(r, c)) continue;
+                    const target = boardState[r][c];
+                    if (target && isPlayerPieceForPosition(target, player)) continue;
+                    if (isValidMoveForPosition(boardState, fromRow, fromCol, r, c, player)) {
+                        moves.push({ fromRow, fromCol, toRow: r, toCol: c });
+                    }
+                }
+            } else {
+                // Sliding piece: rook, bishop, or queen
+                let dirs;
+                if (lower === 'r') dirs = [[1,0],[-1,0],[0,1],[0,-1]];
+                else if (lower === 'b') dirs = [[1,1],[1,-1],[-1,1],[-1,-1]];
+                else dirs = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]];
+                
+                for (const [dx, dy] of dirs) {
+                    let r = fromRow + dy;
+                    let c = fromCol + dx;
+                    while (isInBounds(r, c)) {
+                        const target = boardState[r][c];
+                        if (target && isPlayerPieceForPosition(target, player)) break;
+                        if (isValidMoveForPosition(boardState, fromRow, fromCol, r, c, player)) {
+                            moves.push({ fromRow, fromCol, toRow: r, toCol: c });
+                        }
+                        if (target) break;
+                        r += dy;
+                        c += dx;
                     }
                 }
             }
@@ -1236,8 +1316,6 @@ function quiescenceSearch(boardState, alpha, beta, player, qDepth) {
     const opponent = player === 'white' ? 'black' : 'white';
     
     for (const move of candidateMoves) {
-        // SEE pruning for non-king captures only. King moves are validated by
-        // the legality filter and shouldn't be penalized by SEE.
         const movingPiece = boardState[move.fromRow][move.fromCol];
         const isKingMove = (movingPiece === '♔' || movingPiece === '♚');
         if (!inCheck && !isKingMove) {
@@ -1300,7 +1378,6 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
             const movingPiece = boardState[move.fromRow][move.fromCol];
             const isKingMove = (movingPiece === '♔' || movingPiece === '♚');
             
-            // SEE pruning: non-king captures only
             if (targetPiece && !isKingMove) {
                 const newBoardTest = makeTestMoveForPosition(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol);
                 const givesCheck = newBoardTest && isKingInCheckForPosition(newBoardTest, nextPlayer);
@@ -1347,7 +1424,6 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
             const movingPiece = boardState[move.fromRow][move.fromCol];
             const isKingMove = (movingPiece === '♔' || movingPiece === '♚');
             
-            // SEE pruning: non-king captures only
             if (targetPiece && !isKingMove) {
                 const newBoardTest = makeTestMoveForPosition(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol);
                 const givesCheck = newBoardTest && isKingInCheckForPosition(newBoardTest, nextPlayer);
@@ -1480,8 +1556,6 @@ function findBestMoveWithRiskAssessment() {
             if (isEndlessCheck(testHistory, currentPlayer)) continue;
         }
         
-        // Hang guard: skip moves that hang a piece worth much more than they capture.
-        // King moves are exempt — legality already verified by wouldKingBeInCheckAfter.
         const movingPieceRoot = board[move.fromRow][move.fromCol];
         const isKingMoveRoot = (movingPieceRoot === '♔' || movingPieceRoot === '♚');
         if (!isKingMoveRoot) {
@@ -1989,7 +2063,7 @@ function updateAIStats() {
         winRate = Math.round((stats.whiteWins / stats.totalGames) * 100);
     }
     winRateElement.textContent = winRate;
-    if (difficultyElement) difficultyElement.textContent = `PMTS v2.4.3`;
+    if (difficultyElement) difficultyElement.textContent = `PMTS v2.4.4`;
     if (versionElement) versionElement.textContent = `v${GAME_VERSION}`;
 }
 
@@ -2129,7 +2203,7 @@ function changeGameMode() {
     if (!gameModeSelect || !gameModeDisplay) return;
     gameMode = gameModeSelect.value;
     if (gameMode === 'ai') {
-        gameModeDisplay.textContent = 'vs AI (v2.4.3)';
+        gameModeDisplay.textContent = 'vs AI (v2.4.4)';
         if (aiInfo) aiInfo.style.display = 'block';
         if (currentPlayer === aiPlayer && !gameOver) setTimeout(makeAIMove, 500);
     } else {
@@ -2158,4 +2232,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - King SEE exemption active`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - Optimized move generation active`);
