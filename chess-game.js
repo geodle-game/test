@@ -1,6 +1,6 @@
 // chess-game.js
 // Enhanced chess game with dynamic piece activity + threat-based evaluation
-// VERSION: 2.4.3 - Branch-aware cache pruning
+// VERSION: 2.4.3 - Branch-aware cache pruning + in-place king check
 // COMPATIBLE WITH: chess-ai-database.js (v2.0) and chess-game-database.js (v1.1)
 
 const GAME_VERSION = "2.4.3";
@@ -26,12 +26,7 @@ const CACHE_LIMIT = 500000;
 let LAYER_HITS = 0;
 let LAYER_MISSES = 0;
 
-// The game line at the start of the search (used by cacheGet to validate entries).
 let currentSearchPrefix = "";
-
-// The branch currently being explored inside the search. Gets extended at
-// every recursion by the move played. Entries are tagged with this so that
-// pruneCachesToLine can delete branches that diverged from the real game.
 let currentBranchPrefix = "";
 
 function setSearchPrefix(prefix) {
@@ -39,8 +34,6 @@ function setSearchPrefix(prefix) {
     currentBranchPrefix = prefix;
 }
 
-// Push a move onto the current branch, returning the previous value so it
-// can be restored after the recursive call returns.
 function pushBranch(moveStr) {
     const saved = currentBranchPrefix;
     currentBranchPrefix = currentBranchPrefix ? currentBranchPrefix + "|" + moveStr : moveStr;
@@ -51,10 +44,6 @@ function restoreBranch(saved) {
     currentBranchPrefix = saved;
 }
 
-// Keep an entry only if its stored branch shares a prefix relationship with
-// the actual game line. That is: either the game line continues from where
-// the entry was evaluated, or the entry extends the game line (a deeper line
-// the search explored from a position we actually reached).
 function branchesCompatible(entryPrefix, linePrefix) {
     if (!entryPrefix) return true;
     if (!linePrefix) return true;
@@ -102,8 +91,6 @@ function clearAllCaches() {
 function cacheGet(cache, key) {
     const entry = cache.get(key);
     if (entry === undefined) return undefined;
-    // The position hash is part of the key, so if it's stored for this hash,
-    // it's correct for this position regardless of which branch reached it.
     return entry.value;
 }
 
@@ -1112,6 +1099,19 @@ function isKingInCheckForPosition(boardState, player) {
     return isSquareAttackedForPosition(boardState, kingRow, kingCol, attackerColor);
 }
 
+// In-place king-check test: mutate board, check, restore. No allocation.
+// Safe because the caller never uses boardState between the mutation and restore.
+function wouldKingBeInCheckAfter(boardState, fromRow, fromCol, toRow, toCol, player) {
+    const movingPiece = boardState[fromRow][fromCol];
+    const capturedPiece = boardState[toRow][toCol];
+    boardState[toRow][toCol] = movingPiece;
+    boardState[fromRow][fromCol] = '';
+    const inCheck = isKingInCheckForPosition(boardState, player);
+    boardState[fromRow][fromCol] = movingPiece;
+    boardState[toRow][toCol] = capturedPiece;
+    return inCheck;
+}
+
 function isValidMoveForPosition(boardState, fromRow, fromCol, toRow, toCol, player) {
     if (!boardState) return false;
     if (toRow < 0 || toRow > 7 || toCol < 0 || toCol > 7) return false;
@@ -1158,8 +1158,7 @@ function isValidMoveForPosition(boardState, fromRow, fromCol, toRow, toCol, play
             break;
     }
     if (!valid) return false;
-    const newBoard = makeTestMoveForPosition(boardState, fromRow, fromCol, toRow, toCol);
-    return !isKingInCheckForPosition(newBoard, player);
+    return !wouldKingBeInCheckAfter(boardState, fromRow, fromCol, toRow, toCol, player);
 }
 
 function makeTestMoveForPosition(boardState, fromRow, fromCol, toRow, toCol) {
@@ -2153,4 +2152,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - Branch-aware pruning active`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - Branch pruning + in-place king check`);
