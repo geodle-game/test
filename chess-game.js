@@ -1,6 +1,6 @@
 // chess-game.js
 // Enhanced chess game with dynamic piece activity + threat-based evaluation
-// VERSION: 2.4.2 - Root queen-hang guard + mate-in-1 guard
+// VERSION: 2.4.2 - Fixed root sign convention (AI now plays both colors correctly)
 // COMPATIBLE WITH: chess-ai-database.js (v2.0) and chess-game-database.js (v1.1)
 
 const GAME_VERSION = "2.4.2";
@@ -949,6 +949,9 @@ function evaluatePromotionThreats(boardState, player) {
 }
 
 // ========== MAIN EVALUATION ==========
+// IMPORTANT: This evaluation is ALWAYS from White's perspective.
+// Positive = good for White. Negative = good for Black.
+// The search treats White as the maximizing player and Black as the minimizing player.
 
 function evaluatePositionForSearch(boardState, player, moveNumber) {
     if (!boardState) return 0;
@@ -961,6 +964,7 @@ function evaluatePositionForSearch(boardState, player, moveNumber) {
     let evaluation = 0;
     const opponent = player === 'white' ? 'black' : 'white';
     
+    // Material — always positive for White
     for (let row = 0; row < 8; row++) {
         for (let col = 0; col < 8; col++) {
             const piece = boardState[row] && boardState[row][col];
@@ -971,19 +975,23 @@ function evaluatePositionForSearch(boardState, player, moveNumber) {
         }
     }
     
+    // All terms are added with White-positive sign
     evaluation += evaluateAllPieceActivity(boardState, 'white');
     evaluation -= evaluateAllPieceActivity(boardState, 'black');
-    evaluation -= evaluateOpponentThreats(boardState, player) * 0.5;
-    evaluation -= evaluateKingDanger(boardState, player) * 0.5;
-    evaluation += evaluateKingDanger(boardState, opponent) * 0.5;
-    evaluation += evaluatePawnShield(boardState, player);
-    evaluation -= evaluatePawnShield(boardState, opponent);
-    evaluation += evaluateHangingPieces(boardState, player);
-    evaluation -= evaluateHangingPieces(boardState, opponent);
-    evaluation += evaluatePromotionThreats(boardState, player);
-    evaluation -= evaluatePromotionThreats(boardState, opponent);
-    evaluation += getEndgameCheckPenalty(boardState, player, moveHistory);
-    evaluation += evaluateCheckmatePatterns(boardState, player);
+    evaluation -= evaluateOpponentThreats(boardState, 'white') * 0.5;
+    evaluation += evaluateOpponentThreats(boardState, 'black') * 0.5;
+    evaluation -= evaluateKingDanger(boardState, 'white') * 0.5;
+    evaluation += evaluateKingDanger(boardState, 'black') * 0.5;
+    evaluation += evaluatePawnShield(boardState, 'white');
+    evaluation -= evaluatePawnShield(boardState, 'black');
+    evaluation += evaluateHangingPieces(boardState, 'white');
+    evaluation -= evaluateHangingPieces(boardState, 'black');
+    evaluation += evaluatePromotionThreats(boardState, 'white');
+    evaluation -= evaluatePromotionThreats(boardState, 'black');
+    evaluation += getEndgameCheckPenalty(boardState, 'white', moveHistory);
+    evaluation -= getEndgameCheckPenalty(boardState, 'black', moveHistory);
+    evaluation += evaluateCheckmatePatterns(boardState, 'white');
+    evaluation -= evaluateCheckmatePatterns(boardState, 'black');
     
     cacheSet(evalCache, key, evaluation);
     return evaluation;
@@ -1245,8 +1253,6 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
     const inCheck = isKingInCheckForPosition(boardState, player);
     
     if (depth <= 0 && !inCheck) {
-        // Mate-in-1 guard: extend depth if the side to move has an immediate mate.
-        // Otherwise a quiet non-capture mate would be invisible to quiescence.
         let hasMateIn1 = false;
         const nextSide = player === 'white' ? 'black' : 'white';
         for (const m of moves) {
@@ -1394,8 +1400,10 @@ function findBestMoveWithRiskAssessment() {
     if (allMoves.length === 0) return null;
     
     const opponentColor = currentPlayer === 'white' ? 'black' : 'white';
+    // KEY: the eval is White-positive, so White is the maximizing side.
+    const opponentIsMaximizing = (opponentColor === 'white');
     
-    // ROOT MATE SAFETY NET: if any move is immediate checkmate, play it
+    // Root mate-in-1 shortcut
     for (const move of allMoves) {
         const newBoard = makeTestMoveForPosition(board, move.fromRow, move.fromCol, move.toRow, move.toCol);
         if (newBoard && isKingInCheckForPosition(newBoard, opponentColor)) {
@@ -1446,7 +1454,6 @@ function findBestMoveWithRiskAssessment() {
         }
         
         // Don't hang a piece worth much more than what we capture.
-        // Prevents Qxd5 in the French when Bxd5 wins the queen.
         const targetPieceForHungCheck = board[move.toRow][move.toCol];
         const targetValueForHungCheck = targetPieceForHungCheck ? (PIECE_VALUES[targetPieceForHungCheck] || 0) : 0;
         const hungValue = getHungPieceValue(board, move.fromRow, move.fromCol, move.toRow, move.toCol, currentPlayer);
@@ -1470,9 +1477,9 @@ function findBestMoveWithRiskAssessment() {
         } else {
             const newBoard = makeTestMoveForPosition(board, move.fromRow, move.fromCol, move.toRow, move.toCol);
             
-            const bestResult = minimaxWithRisk(newBoard, searchDepth - 1, -Infinity, Infinity, false, 
+            const bestResult = minimaxWithRisk(newBoard, searchDepth - 1, -Infinity, Infinity, opponentIsMaximizing, 
                 opponentColor, moveCount + 1, false);
-            const worstResult = minimaxWithRisk(newBoard, searchDepth - 1, -Infinity, Infinity, false, 
+            const worstResult = minimaxWithRisk(newBoard, searchDepth - 1, -Infinity, Infinity, opponentIsMaximizing, 
                 opponentColor, moveCount + 1, true);
             
             const worstCase = typeof worstResult === 'object' ? worstResult.best : worstResult;
@@ -1495,27 +1502,28 @@ function findBestMoveWithRiskAssessment() {
     if (evaluatedMoves.length === 0) {
         for (const move of allMoves) {
             const newBoard = makeTestMoveForPosition(board, move.fromRow, move.fromCol, move.toRow, move.toCol);
-            const bestResult = minimaxWithRisk(newBoard, searchDepth - 1, -Infinity, Infinity, false, 
+            const bestResult = minimaxWithRisk(newBoard, searchDepth - 1, -Infinity, Infinity, opponentIsMaximizing, 
                 opponentColor, moveCount + 1, false);
             const bestCase = typeof bestResult === 'object' ? bestResult.best : bestResult;
             evaluatedMoves.push({ move, bestCase, worstCase: bestCase - 100, depth: searchDepth });
         }
     }
     
-    if (currentPlayer === 'black') {
-        evaluatedMoves.sort((a, b) => a.bestCase - b.bestCase);
-    } else {
+    // Eval is White-positive. White AI wants the max, Black AI wants the min.
+    if (currentPlayer === 'white') {
         evaluatedMoves.sort((a, b) => b.bestCase - a.bestCase);
+    } else {
+        evaluatedMoves.sort((a, b) => a.bestCase - b.bestCase);
     }
     
     const riskAssessed = riskAssessor.assessLineRisk(evaluatedMoves);
     
     let bestSafeMove;
-    if (currentPlayer === 'black') {
+    if (currentPlayer === 'white') {
+        bestSafeMove = riskAssessor.findBestSafeMove(riskAssessed);
+    } else {
         bestSafeMove = riskAssessed.reduce((best, current) => 
             current.bestCase < best.bestCase ? current : best, riskAssessed[0]);
-    } else {
-        bestSafeMove = riskAssessor.findBestSafeMove(riskAssessed);
     }
     
     const searchTime = (performance.now() - searchStartTime).toFixed(0);
@@ -2113,4 +2121,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - Queen hang guard + mate-in-1 guard active`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - Fixed root sign convention`);
