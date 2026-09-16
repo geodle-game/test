@@ -1,6 +1,6 @@
 // chess-game.js
 // Enhanced chess game with dynamic piece activity + threat-based evaluation
-// VERSION: 2.4.2 - Fixed minimax sign convention (AI always maximizes)
+// VERSION: 2.4.2 - Root queen-hang guard + mate-in-1 guard
 // COMPATIBLE WITH: chess-ai-database.js (v2.0) and chess-game-database.js (v1.1)
 
 const GAME_VERSION = "2.4.2";
@@ -1188,7 +1188,6 @@ const SEARCH_CONFIG = {
 let transpositionTable = new Map();
 
 function quiescenceSearch(boardState, alpha, beta, player, qDepth) {
-    // Detect checkmate/stalemate at the top — quiescence is not exempt
     const moves = getAllPossibleMovesForPosition(boardState, player);
     if (moves.length === 0) {
         if (isKingInCheckForPosition(boardState, player)) {
@@ -1203,7 +1202,6 @@ function quiescenceSearch(boardState, alpha, beta, player, qDepth) {
     if (standPat >= beta) return beta;
     if (alpha < standPat) alpha = standPat;
     
-    // If in check, consider ALL legal moves (evasions). Otherwise just captures.
     const inCheck = isKingInCheckForPosition(boardState, player);
     const candidateMoves = inCheck
         ? moves
@@ -1235,25 +1233,20 @@ function quiescenceSearch(boardState, alpha, beta, player, qDepth) {
 function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, player, moveNumber, trackWorstCase = false) {
     if (!boardState) return 0;
     
-    // Move generation FIRST — so we detect checkmate/stalemate at any depth
     const moves = getAllPossibleMovesForPosition(boardState, player);
     
-    // Checkmate / stalemate detection at ANY depth
     if (moves.length === 0) {
         if (isKingInCheckForPosition(boardState, player)) {
-            // Mate: prefer faster mates (add depth bonus so shallower mates score higher)
             return isMaximizingPlayer ? (-20000 - depth) : (20000 + depth);
         }
-        return 0; // Stalemate
+        return 0;
     }
     
     const inCheck = isKingInCheckForPosition(boardState, player);
     
     if (depth <= 0 && !inCheck) {
-        // Mate-in-1 guard: before falling to quiescence, check if the side to
-        // move has an immediate mate. If so, force a 1-ply extension so the
-        // search sees it. Without this, a quiet mating move (non-capture) would
-        // be invisible to quiescence (which only looks at captures).
+        // Mate-in-1 guard: extend depth if the side to move has an immediate mate.
+        // Otherwise a quiet non-capture mate would be invisible to quiescence.
         let hasMateIn1 = false;
         const nextSide = player === 'white' ? 'black' : 'white';
         for (const m of moves) {
@@ -1266,13 +1259,10 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
         if (!hasMateIn1) {
             return quiescenceSearch(boardState, alpha, beta, player, SEARCH_CONFIG.quiescenceDepth);
         }
-        // Otherwise fall through and search normally with depth 1
     }
     
-    // Check extension: if in check at depth exhaustion, force at least depth 1
     if (depth <= 0) depth = 1;
     
-    // Order moves
     moves.sort((a, b) => {
         return scoreMoveForOrdering(boardState, b, player, depth) - scoreMoveForOrdering(boardState, a, player, depth);
     });
@@ -1285,8 +1275,6 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
         for (const move of moves) {
             const targetPiece = boardState[move.toRow][move.toCol];
             
-            // SEE pruning at ALL depths — skip captures that lose material,
-            // but never skip a capture that gives check (might be a forcing mate).
             if (targetPiece) {
                 const newBoardTest = makeTestMoveForPosition(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol);
                 const givesCheck = newBoardTest && isKingInCheckForPosition(newBoardTest, nextPlayer);
@@ -1328,8 +1316,6 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
         for (const move of moves) {
             const targetPiece = boardState[move.toRow][move.toCol];
             
-            // SEE pruning at ALL depths — skip captures that lose material,
-            // but never skip a capture that gives check (might be a forcing mate).
             if (targetPiece) {
                 const newBoardTest = makeTestMoveForPosition(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol);
                 const givesCheck = newBoardTest && isKingInCheckForPosition(newBoardTest, nextPlayer);
@@ -1457,6 +1443,16 @@ function findBestMoveWithRiskAssessment() {
         if (isEndgame) {
             const testHistory = [...moveHistory, toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol)];
             if (isEndlessCheck(testHistory, currentPlayer)) continue;
+        }
+        
+        // Don't hang a piece worth much more than what we capture.
+        // Prevents Qxd5 in the French when Bxd5 wins the queen.
+        const targetPieceForHungCheck = board[move.toRow][move.toCol];
+        const targetValueForHungCheck = targetPieceForHungCheck ? (PIECE_VALUES[targetPieceForHungCheck] || 0) : 0;
+        const hungValue = getHungPieceValue(board, move.fromRow, move.fromCol, move.toRow, move.toCol, currentPlayer);
+        if (hungValue > targetValueForHungCheck + 200) {
+            console.log(`⏭️ Skipping ${toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol)} (hangs ${hungValue})`);
+            continue;
         }
         
         let cachedResult = null;
@@ -2117,4 +2113,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - Pruning fixed, mate-in-1 guard active`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - Queen hang guard + mate-in-1 guard active`);
