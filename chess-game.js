@@ -1,9 +1,9 @@
 // chess-game.js
 // Enhanced chess game with dynamic piece activity + threat-based evaluation
-// VERSION: 2.4.4 - Optimized move generation (pattern-based iteration)
+// VERSION: 2.4.7 - Castling in search, defense-aware LMP, refined quiet detection
 // COMPATIBLE WITH: chess-ai-database.js (v2.0) and chess-game-database.js (v1.1)
 
-const GAME_VERSION = "2.4.4";
+const GAME_VERSION = "2.4.5";
 
 // ========== GAME DATABASES ==========
 let openingBook = null;
@@ -109,7 +109,7 @@ function boardToHash(boardState) {
     return hash;
 }
 
-// ========== SEARCH HEURISTICS (KILLER MOVES + HISTORY) ==========
+// ========== SEARCH HEURISTICS ==========
 
 const killerMoves = Array.from({ length: 32 }, () => [null, null]);
 const historyTable = new Map();
@@ -444,8 +444,6 @@ function findKing(boardState, player) {
     return null;
 }
 
-// ========== SMART TACTICAL AWARENESS ==========
-
 function isPieceDefended(boardState, row, col, player) {
     for (let r = 0; r < 8; r++) {
         for (let c = 0; c < 8; c++) {
@@ -464,11 +462,8 @@ function isSquareAttackedByOpponent(boardState, row, col, player) {
     return isSquareAttackedForPosition(boardState, row, col, opponent);
 }
 
-// ========== FULL RECURSIVE STATIC EXCHANGE EVALUATION ==========
+// ========== STATIC EXCHANGE EVALUATION ==========
 
-// Kings are excluded from SEE recapture simulation. SEE can't model king legality
-// (pins, discovered checks), so including the king leads to false "you'll lose your
-// 20000-value king" penalties. King moves are validated separately by wouldKingBeInCheckAfter.
 function findCheapestAttacker(boardState, targetRow, targetCol, color) {
     let bestValue = Infinity;
     let bestAttacker = null;
@@ -521,16 +516,10 @@ function evaluateCaptureSafety(boardState, fromRow, fromCol, toRow, toCol, playe
     return victimValue - opponentBest;
 }
 
-function findLowestValueAttacker(boardState, targetRow, targetCol, attackerColor) {
-    return findCheapestAttacker(boardState, targetRow, targetCol, attackerColor);
-}
-
 function getHungPieceValue(boardState, fromRow, fromCol, toRow, toCol, player) {
     const newBoard = makeTestMoveForPosition(boardState, fromRow, fromCol, toRow, toCol);
     if (!newBoard) return 0;
     
-    // Only consider the moved piece, and never treat the king as "hanging"
-    // (king moves are validated by wouldKingBeInCheckAfter).
     const movedPiece = newBoard[toRow][toCol];
     if (movedPiece && movedPiece !== '♔' && movedPiece !== '♚') {
         const movedValue = PIECE_VALUES[movedPiece] || 0;
@@ -544,7 +533,7 @@ function getHungPieceValue(boardState, fromRow, fromCol, toRow, toCol, player) {
     return 0;
 }
 
-// ========== PAWN SHIELD EVALUATION ==========
+// ========== PAWN SHIELD ==========
 
 function evaluatePawnShield(boardState, player) {
     const key = boardToHash(boardState) + "|shield|" + player;
@@ -586,7 +575,7 @@ function evaluatePawnShield(boardState, player) {
     return shieldScore;
 }
 
-// ========== HANGING PIECES EVALUATION ==========
+// ========== HANGING PIECES ==========
 
 function evaluateHangingPieces(boardState, player) {
     const key = boardToHash(boardState) + "|hang|" + player;
@@ -623,7 +612,7 @@ function evaluateHangingPieces(boardState, player) {
     return hangingScore;
 }
 
-// ========== DYNAMIC PIECE ACTIVITY EVALUATION ==========
+// ========== DYNAMIC PIECE ACTIVITY ==========
 
 function evaluateAllPieceActivity(boardState, player) {
     const key = boardToHash(boardState) + "|act|" + player;
@@ -997,7 +986,7 @@ function evaluatePositionForSearch(boardState, player, moveNumber) {
     return evaluation;
 }
 
-// ========== INTERNAL HELPERS ==========
+// ========== HELPERS ==========
 
 function isPlayerPieceForPosition(piece, player) {
     if (!piece) return false;
@@ -1144,7 +1133,18 @@ function isValidMoveForPosition(boardState, fromRow, fromCol, toRow, toCol, play
             valid = (dx === 0 || dy === 0 || absDx === absDy) && isPathClearForPosition(boardState, fromRow, fromCol, toRow, toCol);
             break;
         case 'k':
-            valid = absDx <= 1 && absDy <= 1;
+            // Allow castling: king moves 2 squares horizontally from its starting square
+            if (absDx === 2 && absDy === 0) {
+                if (player === 'white' && fromRow === 7 && fromCol === 4) {
+                    if (toCol === 6 && castlingRights.whiteKingside) valid = true;
+                    if (toCol === 2 && castlingRights.whiteQueenside) valid = true;
+                } else if (player === 'black' && fromRow === 0 && fromCol === 4) {
+                    if (toCol === 6 && castlingRights.blackKingside) valid = true;
+                    if (toCol === 2 && castlingRights.blackQueenside) valid = true;
+                }
+            } else {
+                valid = absDx <= 1 && absDy <= 1;
+            }
             break;
     }
     if (!valid) return false;
@@ -1158,13 +1158,41 @@ function makeTestMoveForPosition(boardState, fromRow, fromCol, toRow, toCol) {
     if (newBoard[toRow] && piece) {
         newBoard[toRow][toCol] = piece;
         newBoard[fromRow][fromCol] = '';
+        
+        // Castling: also move the rook
+        if ((piece === '♔' || piece === '♚') && Math.abs(toCol - fromCol) === 2 && fromRow === toRow) {
+            const isKingside = toCol > fromCol;
+            const rookFromCol = isKingside ? 7 : 0;
+            const rookToCol = isKingside ? 5 : 3;
+            const rook = newBoard[fromRow][rookFromCol];
+            if (rook === '♖' || rook === '♜') {
+                newBoard[fromRow][rookToCol] = rook;
+                newBoard[fromRow][rookFromCol] = '';
+            }
+        }
     }
     return newBoard;
 }
 
-// Optimized move generation: iterate only the pattern-valid target squares per piece
-// instead of scanning all 64 squares. Same legal moves generated (isValidMoveForPosition
-// still runs on every pattern-valid target), just fewer wasted iterations.
+// ========== MOVE GENERATION WITH CASTLING ==========
+
+function canCastleForSearch(boardState, fromRow, fromCol, toRow, toCol, player) {
+    // King must not currently be in check
+    if (isKingInCheckForPosition(boardState, player)) return false;
+    
+    // Squares the king passes through must not be attacked
+    const isKingside = toCol > fromCol;
+    const direction = isKingside ? 1 : -1;
+    const opponent = player === 'white' ? 'black' : 'white';
+    
+    for (let i = 0; i <= 2; i++) {
+        const testCol = fromCol + (direction * i);
+        if (isSquareAttackedForPosition(boardState, fromRow, testCol, opponent)) return false;
+    }
+    
+    return true;
+}
+
 function getAllPossibleMovesForPosition(boardState, player) {
     if (!boardState) return [];
     const moves = [];
@@ -1182,13 +1210,11 @@ function getAllPossibleMovesForPosition(boardState, player) {
                 const direction = pieceCode === 'P' ? -1 : 1;
                 const startRow = pieceCode === 'P' ? 6 : 1;
                 
-                // One square forward
                 const oneR = fromRow + direction;
                 if (isInBounds(oneR, fromCol) && !boardState[oneR][fromCol]) {
                     if (isValidMoveForPosition(boardState, fromRow, fromCol, oneR, fromCol, player)) {
                         moves.push({ fromRow, fromCol, toRow: oneR, toCol: fromCol });
                     }
-                    // Two squares forward (only from starting row, only if intermediate empty)
                     if (fromRow === startRow) {
                         const twoR = fromRow + 2 * direction;
                         if (isInBounds(twoR, fromCol) && !boardState[twoR][fromCol]) {
@@ -1199,7 +1225,6 @@ function getAllPossibleMovesForPosition(boardState, player) {
                     }
                 }
                 
-                // Diagonal captures
                 for (const dc of [-1, 1]) {
                     const capR = fromRow + direction;
                     const capC = fromCol + dc;
@@ -1235,8 +1260,28 @@ function getAllPossibleMovesForPosition(boardState, player) {
                         moves.push({ fromRow, fromCol, toRow: r, toCol: c });
                     }
                 }
+                
+                // Castling generation
+                const homeRow = player === 'white' ? 7 : 0;
+                if (fromRow === homeRow && fromCol === 4) {
+                    const rook = player === 'white' ? '♖' : '♜';
+                    const canKingside = player === 'white' ? castlingRights.whiteKingside : castlingRights.blackKingside;
+                    const canQueenside = player === 'white' ? castlingRights.whiteQueenside : castlingRights.blackQueenside;
+                    
+                    if (canKingside && boardState[homeRow][7] === rook &&
+                        !boardState[homeRow][5] && !boardState[homeRow][6]) {
+                        if (canCastleForSearch(boardState, homeRow, 4, homeRow, 6, player)) {
+                            moves.push({ fromRow: homeRow, fromCol: 4, toRow: homeRow, toCol: 6 });
+                        }
+                    }
+                    if (canQueenside && boardState[homeRow][0] === rook &&
+                        !boardState[homeRow][1] && !boardState[homeRow][2] && !boardState[homeRow][3]) {
+                        if (canCastleForSearch(boardState, homeRow, 4, homeRow, 2, player)) {
+                            moves.push({ fromRow: homeRow, fromCol: 4, toRow: homeRow, toCol: 2 });
+                        }
+                    }
+                }
             } else {
-                // Sliding piece: rook, bishop, or queen
                 let dirs;
                 if (lower === 'r') dirs = [[1,0],[-1,0],[0,1],[0,-1]];
                 else if (lower === 'b') dirs = [[1,1],[1,-1],[-1,1],[-1,-1]];
@@ -1274,7 +1319,98 @@ function isEndgamePositionForPosition(boardState) {
     return pieceCount <= 10;
 }
 
-// ========== MINIMAX WITH QUIESCENCE + CHECK EXTENSIONS ==========
+// ========== QUIET MOVE DETECTION (with defense test) ==========
+
+function isQuietMove(boardState, move, player) {
+    const piece = boardState[move.fromRow][move.fromCol];
+    if (!piece) return true;
+    
+    const target = boardState[move.toRow][move.toCol];
+    const pieceCode = pieceMap[piece];
+    const lower = pieceCode ? pieceCode.toLowerCase() : '';
+    
+    // 1. Captures
+    if (target) return false;
+    
+    // 2. Promotions
+    if (lower === 'p') {
+        if ((pieceCode === 'P' && move.toRow === 0) ||
+            (pieceCode === 'p' && move.toRow === 7)) return false;
+    }
+    
+    // 3. Castling
+    if (lower === 'k' && Math.abs(move.toCol - move.fromCol) === 2) return false;
+    
+    const opponent = player === 'white' ? 'black' : 'white';
+    const enemyQueen = player === 'white' ? '♛' : '♕';
+    
+    // 5. Moving away from attack
+    if (isSquareAttackedForPosition(boardState, move.fromRow, move.fromCol, opponent)) {
+        return false;
+    }
+    
+    // Pre-move reachable count
+    const preReachable = getReachableSquares(boardState, move.fromRow, move.fromCol, piece, player).length;
+    
+    // Apply the move in place
+    boardState[move.toRow][move.toCol] = piece;
+    boardState[move.fromRow][move.fromCol] = '';
+    
+    // 4. Gives check (post-move)
+    const kingPos = findKing(boardState, opponent);
+    const givesCheck = kingPos && canPieceAttackForPosition(piece, move.toRow, move.toCol, kingPos.row, kingPos.col, boardState);
+    
+    // 6. Attacks enemy queen
+    let attacksQueen = false;
+    for (let r = 0; r < 8 && !attacksQueen; r++) {
+        for (let c = 0; c < 8 && !attacksQueen; c++) {
+            if (boardState[r][c] === enemyQueen) {
+                if (canPieceAttackForPosition(piece, move.toRow, move.toCol, r, c, boardState)) {
+                    attacksQueen = true;
+                }
+            }
+        }
+    }
+    
+    // 9. Defends an attacked friendly piece (post-move)
+    let defendsAttacked = false;
+    for (let r = 0; r < 8 && !defendsAttacked; r++) {
+        for (let c = 0; c < 8 && !defendsAttacked; c++) {
+            const friendlyPiece = boardState[r][c];
+            if (!friendlyPiece) continue;
+            if (!isPlayerPieceForPosition(friendlyPiece, player)) continue;
+            if (r === move.toRow && c === move.toCol) continue;
+            if (isSquareAttackedForPosition(boardState, r, c, opponent)) {
+                if (canPieceAttackForPosition(piece, move.toRow, move.toCol, r, c, boardState)) {
+                    defendsAttacked = true;
+                }
+            }
+        }
+    }
+    
+    // Post-move reachable count
+    const postReachable = getReachableSquares(boardState, move.toRow, move.toCol, piece, player).length;
+    
+    // Restore the board
+    boardState[move.fromRow][move.fromCol] = piece;
+    boardState[move.toRow][move.toCol] = target;
+    
+    if (givesCheck) return false;
+    if (attacksQueen) return false;
+    if (defendsAttacked) return false;
+    
+    // 7. Advances toward the enemy
+    const rowDelta = move.toRow - move.fromRow;
+    if (player === 'white' && rowDelta < 0) return false;
+    if (player === 'black' && rowDelta > 0) return false;
+    
+    // 8. Meaningful mobility gain (>= 2 new squares)
+    if (postReachable > preReachable + 1) return false;
+    
+    return true;
+}
+
+// ========== MINIMAX WITH QUIESCENCE + CHECK EXTENSIONS + REFINED LMP ==========
 
 const SEARCH_CONFIG = {
     baseDepth: 3,
@@ -1367,6 +1503,12 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
     moves.sort((a, b) => {
         return scoreMoveForOrdering(boardState, b, player, depth) - scoreMoveForOrdering(boardState, a, player, depth);
     });
+    
+    let quietMoveLimit = Infinity;
+    if (!inCheck) {
+        quietMoveLimit = 3 + depth * depth;
+    }
+    let quietMovesSearched = 0;
 
     if (isMaximizingPlayer) {
         let maxEval = -Infinity;
@@ -1385,6 +1527,12 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
                     const see = evaluateCaptureSafety(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol, player);
                     if (see < 0) continue;
                 }
+            }
+            
+            if (quietMovesSearched >= quietMoveLimit) {
+                if (isQuietMove(boardState, move, player)) continue;
+            } else {
+                if (isQuietMove(boardState, move, player)) quietMovesSearched++;
             }
             
             const moveStr = toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol);
@@ -1431,6 +1579,12 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
                     const see = evaluateCaptureSafety(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol, player);
                     if (see < 0) continue;
                 }
+            }
+            
+            if (quietMovesSearched >= quietMoveLimit) {
+                if (isQuietMove(boardState, move, player)) continue;
+            } else {
+                if (isQuietMove(boardState, move, player)) quietMovesSearched++;
             }
             
             const moveStr = toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol);
@@ -2063,7 +2217,7 @@ function updateAIStats() {
         winRate = Math.round((stats.whiteWins / stats.totalGames) * 100);
     }
     winRateElement.textContent = winRate;
-    if (difficultyElement) difficultyElement.textContent = `PMTS v2.4.4`;
+    if (difficultyElement) difficultyElement.textContent = `PMTS v2.4.7`;
     if (versionElement) versionElement.textContent = `v${GAME_VERSION}`;
 }
 
@@ -2203,7 +2357,7 @@ function changeGameMode() {
     if (!gameModeSelect || !gameModeDisplay) return;
     gameMode = gameModeSelect.value;
     if (gameMode === 'ai') {
-        gameModeDisplay.textContent = 'vs AI (v2.4.4)';
+        gameModeDisplay.textContent = 'vs AI (v2.4.7)';
         if (aiInfo) aiInfo.style.display = 'block';
         if (currentPlayer === aiPlayer && !gameOver) setTimeout(makeAIMove, 500);
     } else {
@@ -2232,4 +2386,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - Optimized move generation active`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - Castling in search + defense-aware LMP`);
