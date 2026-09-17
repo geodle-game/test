@@ -126,6 +126,14 @@
             font-weight: bold;
         }
 
+        .square img.piece-image {
+            width: 80%;
+            height: 80%;
+            pointer-events: none;
+            user-select: none;
+            object-fit: contain;
+        }
+
         .light { 
             background-color: #f0d9b5;
         }
@@ -569,7 +577,46 @@
     <script src="chess-game.js"></script>
 
     <script>
-        // Enhanced status updates with animations
+        // ========== PAWN IMAGE SWAP ==========
+        // After the board is rendered by createBoard(), replace the pawn glyphs
+        // with images from assets/. White pawn = ♙, Black pawn = ♟.
+        const PAWN_IMAGES = {
+            '♙': 'assets/white_pawn.png',
+            '♟': 'assets/black_pawn.png'
+        };
+
+        function applyPawnImages() {
+            const squares = document.querySelectorAll('#chessboard .square');
+            squares.forEach(sq => {
+                const text = sq.textContent.trim();
+                if (text === '♙' || text === '♟') {
+                    sq.textContent = '';
+                    const img = document.createElement('img');
+                    img.src = PAWN_IMAGES[text];
+                    img.alt = text === '♙' ? 'White pawn' : 'Black pawn';
+                    img.className = 'piece-image';
+                    sq.appendChild(img);
+                }
+            });
+        }
+
+        // Wrap createBoard so every redraw gets images applied automatically.
+        // We poll for the function to exist, then replace it.
+        const _pawnSwapInterval = setInterval(() => {
+            if (typeof window.createBoard === 'function') {
+                const originalCreateBoard = window.createBoard;
+                window.createBoard = function() {
+                    originalCreateBoard.apply(this, arguments);
+                    applyPawnImages();
+                };
+                clearInterval(_pawnSwapInterval);
+                // In case a board is already on screen from the initial load
+                applyPawnImages();
+            }
+        }, 50);
+
+        // ========== EXISTING PAGE HELPERS ==========
+
         function updateStatusWithAnimation(message, type = 'normal') {
             const statusElement = document.getElementById('status');
             if (statusElement) {
@@ -579,7 +626,6 @@
             }
         }
 
-        // Keyboard shortcuts
         document.addEventListener('keydown', function(e) {
             if (e.ctrlKey || e.metaKey) {
                 switch(e.key) {
@@ -604,7 +650,6 @@
             }
         });
 
-        // Enhanced piece animation
         function animatePieceMove(fromSquare, toSquare) {
             const fromElement = document.getElementById(fromSquare);
             const toElement = document.getElementById(toSquare);
@@ -620,14 +665,12 @@
             }
         }
 
-        // Welcome message
         window.addEventListener('load', function() {
             setTimeout(() => {
                 console.log('🎯 Welcome to Smart Chess AI! 🤖');
             }, 1000);
         });
 
-        // Visual feedback for moves
         function addMoveEffect(square) {
             const element = document.getElementById(square);
             if (element) {
@@ -639,19 +682,16 @@
             }
         }
 
-        // Error handling
         window.addEventListener('error', function(e) {
             console.error('Game error:', e.error);
         });
 
-        // Prevent context menu on chess board
         document.addEventListener('contextmenu', function(e) {
             if (e.target.classList.contains('square')) {
                 e.preventDefault();
             }
         });
 
-        // Touch support for mobile
         let touchStartSquare = null;
         document.addEventListener('touchstart', function(e) {
             if (e.target.classList.contains('square')) {
@@ -667,7 +707,6 @@
             touchStartSquare = null;
         });
 
-        // Prevent zoom on double tap
         let lastTouchEnd = 0;
         document.addEventListener('touchend', function(event) {
             const now = (new Date()).getTime();
@@ -677,12 +716,10 @@
             lastTouchEnd = now;
         }, false);
 
-        // Load game after DOM is ready
         document.addEventListener('DOMContentLoaded', function() {
             console.log('🎯 Chess game interface loaded successfully!');
         });
 
-        // Fallback error handling
         window.onerror = function(msg, url, lineNo, columnNo, error) {
             console.log('Error: ' + msg + '\nURL: ' + url + '\nLine: ' + lineNo);
             return false;
