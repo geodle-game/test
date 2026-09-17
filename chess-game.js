@@ -1744,14 +1744,13 @@ function findBestMoveWithRiskAssessment() {
             const savedBranch = pushBranch(moveStr);
             const newBoard = makeTestMoveForPosition(board, move.fromRow, move.fromCol, move.toRow, move.toCol);
             
-            const bestResult = minimaxWithRisk(newBoard, searchDepth - 1, -Infinity, Infinity, opponentIsMaximizing, 
-                opponentColor, moveCount + 1, false);
-            const worstResult = minimaxWithRisk(newBoard, searchDepth - 1, -Infinity, Infinity, opponentIsMaximizing, 
+            // Single search with trackWorstCase=true — returns { best, worst }.
+            const result = minimaxWithRisk(newBoard, searchDepth - 1, -Infinity, Infinity, opponentIsMaximizing, 
                 opponentColor, moveCount + 1, true);
             restoreBranch(savedBranch);
             
-            const worstCase = typeof worstResult === 'object' ? worstResult.best : worstResult;
-            let bestCase = typeof bestResult === 'object' ? bestResult.best : bestResult;
+            let bestCase = typeof result === 'object' ? result.best : result;
+            const worstCase = typeof result === 'object' ? result.worst : result;
             
             const targetPiece = board[move.toRow][move.toCol];
             if (targetPiece && !isKingMoveRoot) {
@@ -1772,11 +1771,12 @@ function findBestMoveWithRiskAssessment() {
             const moveStr = toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol);
             const savedBranch = pushBranch(moveStr);
             const newBoard = makeTestMoveForPosition(board, move.fromRow, move.fromCol, move.toRow, move.toCol);
-            const bestResult = minimaxWithRisk(newBoard, searchDepth - 1, -Infinity, Infinity, opponentIsMaximizing, 
-                opponentColor, moveCount + 1, false);
+            const result = minimaxWithRisk(newBoard, searchDepth - 1, -Infinity, Infinity, opponentIsMaximizing, 
+                opponentColor, moveCount + 1, true);
             restoreBranch(savedBranch);
-            const bestCase = typeof bestResult === 'object' ? bestResult.best : bestResult;
-            evaluatedMoves.push({ move, bestCase, worstCase: bestCase - 100, depth: searchDepth });
+            const bestCase = typeof result === 'object' ? result.best : result;
+            const worstCase = typeof result === 'object' ? result.worst : result;
+            evaluatedMoves.push({ move, bestCase, worstCase, depth: searchDepth });
         }
     }
     
@@ -1844,7 +1844,6 @@ function handleSquareClick(row, col) {
         if (fromRow === row && fromCol === col) { clearSelection(); return; }
         if (isValidMove(fromRow, fromCol, row, col)) {
             makeMove(fromRow, fromCol, row, col);
-            // makeMove already redrew the board; skip clearSelection's redundant redraw.
             selectedSquare = null;
             switchPlayer();
             updateStatus();
@@ -2392,4 +2391,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - ASCII hashing + memoized defense/attacker + deferred localStorage`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - single-search risk assessment + deferred localStorage`);
