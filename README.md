@@ -2,7 +2,7 @@
 Advanced Chess AI – Optimized
 Project Overview
 Advanced Chess AI – Optimized is a high-performance, browser-based chess engine playable exclusively at:
-https://centuarai.netlify.app
+https://geodle-game.github.io/CentuarAI
 This project offers an advanced chess experience with multiple difficulty levels, move analysis, and real-time board evaluation—all without requiring any installation or downloads.
 
 Features
@@ -11,7 +11,7 @@ Real-time move analysis and evaluation
 Undo, redo, and side-switching options
 Clean, responsive UI for desktop and mobile
 How to Play
-Simply visit https://centuarai.netlify.app in your browser.
+Simply visit https://goedle-game.github.io/CentuarAI in your browser.
 No downloads, no installation, no cloning—just play instantly.
 Usage Rules & Restrictions (Strict)
 The code, logic, and design of Advanced Chess AI – Optimized are 100% proprietary.
