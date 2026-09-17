@@ -20,6 +20,8 @@ const promotionCache = new Map();
 const mateCache = new Map();
 const pawnShieldCache = new Map();
 const hangingCache = new Map();
+const defendedCache = new Map();
+const cheapestAttackerCache = new Map();
 
 const CACHE_LIMIT = 500000;
 
@@ -56,7 +58,7 @@ function pruneCachesToLine(actualLine) {
     
     const caches = [evalCache, activityCache, threatCache, attackCache, 
                     reachableCache, kingDangerCache, promotionCache, mateCache,
-                    pawnShieldCache, hangingCache];
+                    pawnShieldCache, hangingCache, defendedCache, cheapestAttackerCache];
     
     for (const cache of caches) {
         const toDelete = [];
@@ -82,6 +84,8 @@ function clearAllCaches() {
     mateCache.clear();
     pawnShieldCache.clear();
     hangingCache.clear();
+    defendedCache.clear();
+    cheapestAttackerCache.clear();
     LAYER_HITS = 0;
     LAYER_MISSES = 0;
     currentSearchPrefix = "";
@@ -99,11 +103,18 @@ function cacheSet(cache, key, value) {
     cache.set(key, { value, prefix: currentBranchPrefix });
 }
 
+const PIECE_TO_CHAR = {
+    '♜': 'r', '♞': 'n', '♝': 'b', '♛': 'q', '♚': 'k', '♟': 'p',
+    '♖': 'R', '♘': 'N', '♗': 'B', '♕': 'Q', '♔': 'K', '♙': 'P'
+};
+
 function boardToHash(boardState) {
     let hash = "";
     for (let row = 0; row < 8; row++) {
+        const r = boardState[row];
         for (let col = 0; col < 8; col++) {
-            hash += boardState[row][col] || ".";
+            const c = PIECE_TO_CHAR[r[col]];
+            hash += c || '.';
         }
     }
     return hash;
@@ -165,7 +176,6 @@ class PersistentMoveTree {
         this.tree = new Map();
         this.positionCache = new Map();
         this.activeLineMoves = [];
-        this._dirty = false;
         this.loadFromStorage();
     }
 
@@ -185,7 +195,7 @@ class PersistentMoveTree {
         return hash;
     }
 
-    storeMoveEvaluation(move, evaluation, depth, variations, isBestLine = false, deferSave = true) {
+    storeMoveEvaluation(move, evaluation, depth, variations, isBestLine = false) {
         const key = this.getMoveKey(move.fromRow, move.fromCol, move.toRow, move.toCol);
         const currentBoard = typeof window !== 'undefined' && window.board ? window.board : null;
         const currentCastling = typeof window !== 'undefined' && window.castlingRights ? window.castlingRights : {};
@@ -203,8 +213,7 @@ class PersistentMoveTree {
         
         this.tree.set(key, node);
         if (positionHash !== "empty") this.positionCache.set(positionHash, node);
-        this._dirty = true;
-        if (!deferSave) this.saveToStorage();
+        // Save deferred: persistence happens once per real move via pruneInactiveLines.
         return node;
     }
 
@@ -233,12 +242,10 @@ class PersistentMoveTree {
             if (!shouldKeep) toDelete.push(key);
         }
         for (const key of toDelete) this.tree.delete(key);
-        this._dirty = true;
         this.saveToStorage();
     }
 
     saveToStorage() {
-        if (!this._dirty) return;
         try {
             const data = {
                 tree: Array.from(this.tree.entries()),
@@ -247,7 +254,6 @@ class PersistentMoveTree {
                 lastUpdated: Date.now()
             };
             localStorage.setItem('chess_persistent_tree', JSON.stringify(data));
-            this._dirty = false;
         } catch (e) {}
     }
 
@@ -267,7 +273,6 @@ class PersistentMoveTree {
     clear() {
         this.tree.clear();
         this.positionCache.clear();
-        this._dirty = false;
         localStorage.removeItem('chess_persistent_tree');
     }
 
@@ -332,16 +337,14 @@ const PIECE_VALUES = {
     '': 0
 };
 
-const MATE_BOUND = 19000;
-
 // ========== ENDGAME CHECK PREVENTION ==========
 
-function isEndlessCheck(line, player) {
-    if (!line || line.length < 6) return false;
+function isEndlessCheck(moveHistory, player) {
+    if (moveHistory.length < 6) return false;
     let consecutiveChecks = 0;
     let checksByPlayer = 0;
-    for (let i = line.length - 1; i >= 0 && i >= line.length - 10; i--) {
-        const move = line[i];
+    for (let i = moveHistory.length - 1; i >= 0 && i >= moveHistory.length - 10; i--) {
+        const move = moveHistory[i];
         if (move && (move.includes('+') || move.includes('#'))) {
             consecutiveChecks++;
             const moveIndex = i;
@@ -355,18 +358,14 @@ function isEndlessCheck(line, player) {
     return consecutiveChecks >= 3 && checksByPlayer >= 3;
 }
 
-function getEndgameCheckPenalty(boardState, player, searchLine) {
+function getEndgameCheckPenalty(boardState, player, moveHistory) {
     const isEndgame = isEndgamePositionForPosition(boardState);
     if (!isEndgame) return 0;
-    
-    const line = searchLine || [];
-    if (line.length === 0) return 0;
-    
-    if (isEndlessCheck(line, player)) return -250;
+    if (isEndlessCheck(moveHistory, player)) return -250;
     
     let recentChecks = 0;
-    for (let i = line.length - 1; i >= 0 && i >= line.length - 6; i--) {
-        if (line[i] && (line[i].includes('+') || line[i].includes('#'))) recentChecks++;
+    for (let i = moveHistory.length - 1; i >= 0 && i >= moveHistory.length - 6; i--) {
+        if (moveHistory[i] && (moveHistory[i].includes('+') || moveHistory[i].includes('#'))) recentChecks++;
     }
     if (recentChecks >= 4) return -150;
     if (recentChecks >= 3) return -80;
@@ -457,16 +456,23 @@ function findKing(boardState, player) {
 }
 
 function isPieceDefended(boardState, row, col, player) {
-    for (let r = 0; r < 8; r++) {
-        for (let c = 0; c < 8; c++) {
+    const key = boardToHash(boardState) + "|def|" + row + "," + col + "|" + player;
+    const cached = cacheGet(defendedCache, key);
+    if (cached !== undefined) return cached;
+    
+    let result = false;
+    for (let r = 0; r < 8 && !result; r++) {
+        for (let c = 0; c < 8 && !result; c++) {
             const piece = boardState[r] && boardState[r][c];
             if (piece && isPlayerPieceForPosition(piece, player)) {
                 if (r === row && c === col) continue;
-                if (canPieceAttackForPosition(piece, r, c, row, col, boardState)) return true;
+                if (canPieceAttackForPosition(piece, r, c, row, col, boardState)) result = true;
             }
         }
     }
-    return false;
+    
+    cacheSet(defendedCache, key, result);
+    return result;
 }
 
 function isSquareAttackedByOpponent(boardState, row, col, player) {
@@ -477,6 +483,10 @@ function isSquareAttackedByOpponent(boardState, row, col, player) {
 // ========== STATIC EXCHANGE EVALUATION ==========
 
 function findCheapestAttacker(boardState, targetRow, targetCol, color) {
+    const key = boardToHash(boardState) + "|cheap|" + targetRow + "," + targetCol + "|" + color;
+    const cached = cacheGet(cheapestAttackerCache, key);
+    if (cached !== undefined) return cached;
+    
     let bestValue = Infinity;
     let bestAttacker = null;
     
@@ -494,6 +504,8 @@ function findCheapestAttacker(boardState, targetRow, targetCol, color) {
             }
         }
     }
+    
+    cacheSet(cheapestAttackerCache, key, bestAttacker);
     return bestAttacker;
 }
 
@@ -956,15 +968,10 @@ function evaluatePromotionThreats(boardState, player) {
 
 // ========== MAIN EVALUATION ==========
 
-function evaluatePositionForSearch(boardState, player, moveNumber, searchLine) {
+function evaluatePositionForSearch(boardState, player, moveNumber) {
     if (!boardState) return 0;
     
-    // Fix C: only key on lineTail for shallow nodes (near root).
-    // Deep nodes share a plain key to prevent cache bloat during search.
-    const line = searchLine || [];
-    const useLineInKey = line.length <= 2;
-    const lineTail = useLineInKey ? line.slice(-6).join("") : "";
-    const key = boardToHash(boardState) + "|eval|" + player + (useLineInKey ? "|" + lineTail : "");
+    const key = boardToHash(boardState) + "|eval|" + player;
     const cached = cacheGet(evalCache, key);
     if (cached !== undefined) { LAYER_HITS++; return cached; }
     LAYER_MISSES++;
@@ -993,9 +1000,8 @@ function evaluatePositionForSearch(boardState, player, moveNumber, searchLine) {
     evaluation -= evaluateHangingPieces(boardState, 'black');
     evaluation += evaluatePromotionThreats(boardState, 'white');
     evaluation -= evaluatePromotionThreats(boardState, 'black');
-    
-    evaluation += getEndgameCheckPenalty(boardState, 'white', line);
-    evaluation -= getEndgameCheckPenalty(boardState, 'black', line);
+    evaluation += getEndgameCheckPenalty(boardState, 'white', moveHistory);
+    evaluation -= getEndgameCheckPenalty(boardState, 'black', moveHistory);
     evaluation += evaluateCheckmatePatterns(boardState, 'white');
     evaluation -= evaluateCheckmatePatterns(boardState, 'black');
     
@@ -1331,7 +1337,7 @@ function isEndgamePositionForPosition(boardState) {
     return pieceCount <= 10;
 }
 
-// ========== QUIET MOVE DETECTION ==========
+// ========== QUIET MOVE DETECTION (with defense test) ==========
 
 function isQuietMove(boardState, move, player) {
     const piece = boardState[move.fromRow][move.fromCol];
@@ -1409,7 +1415,7 @@ function isQuietMove(boardState, move, player) {
     return true;
 }
 
-// ========== MINIMAX WITH QUIESCENCE + CHECK EXTENSIONS + REFINED LMP + PVS ==========
+// ========== MINIMAX WITH QUIESCENCE + CHECK EXTENSIONS + REFINED LMP ==========
 
 const SEARCH_CONFIG = {
     baseDepth: 3,
@@ -1420,7 +1426,7 @@ const SEARCH_CONFIG = {
 
 let transpositionTable = new Map();
 
-function quiescenceSearch(boardState, alpha, beta, player, qDepth, searchLine) {
+function quiescenceSearch(boardState, alpha, beta, player, qDepth) {
     const moves = getAllPossibleMovesForPosition(boardState, player);
     if (moves.length === 0) {
         if (isKingInCheckForPosition(boardState, player)) {
@@ -1429,9 +1435,9 @@ function quiescenceSearch(boardState, alpha, beta, player, qDepth, searchLine) {
         return 0;
     }
     
-    if (qDepth <= 0) return evaluatePositionForSearch(boardState, player, moveCount, searchLine);
+    if (qDepth <= 0) return evaluatePositionForSearch(boardState, player, moveCount);
     
-    let standPat = evaluatePositionForSearch(boardState, player, moveCount, searchLine);
+    let standPat = evaluatePositionForSearch(boardState, player, moveCount);
     if (standPat >= beta) return beta;
     if (alpha < standPat) alpha = standPat;
     
@@ -1460,8 +1466,7 @@ function quiescenceSearch(boardState, alpha, beta, player, qDepth, searchLine) {
         const moveStr = toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol);
         const savedBranch = pushBranch(moveStr);
         const newBoard = makeTestMoveForPosition(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol);
-        const nextLine = (searchLine || []).concat(moveStr);
-        const score = -quiescenceSearch(newBoard, -beta, -alpha, opponent, qDepth - 1, nextLine);
+        const score = -quiescenceSearch(newBoard, -beta, -alpha, opponent, qDepth - 1);
         restoreBranch(savedBranch);
         if (score >= beta) return beta;
         if (score > alpha) alpha = score;
@@ -1469,16 +1474,14 @@ function quiescenceSearch(boardState, alpha, beta, player, qDepth, searchLine) {
     return alpha;
 }
 
-function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, player, moveNumber, trackWorstCase = false, searchLine = []) {
+function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, player, moveNumber, trackWorstCase = false) {
     if (!boardState) return 0;
     
     const moves = getAllPossibleMovesForPosition(boardState, player);
     
     if (moves.length === 0) {
         if (isKingInCheckForPosition(boardState, player)) {
-            // Fix B: clamp mate scores so they never mix with positional eval.
-            const mateScore = 20000 + depth;
-            return isMaximizingPlayer ? -mateScore : mateScore;
+            return isMaximizingPlayer ? (-20000 - depth) : (20000 + depth);
         }
         return 0;
     }
@@ -1496,7 +1499,7 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
             }
         }
         if (!hasMateIn1) {
-            return quiescenceSearch(boardState, alpha, beta, player, SEARCH_CONFIG.quiescenceDepth, searchLine);
+            return quiescenceSearch(boardState, alpha, beta, player, SEARCH_CONFIG.quiescenceDepth);
         }
     }
     
@@ -1512,12 +1515,10 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
     }
     let quietMovesSearched = 0;
 
-    const nextPlayer = player === 'white' ? 'black' : 'white';
-    
     if (isMaximizingPlayer) {
         let maxEval = -Infinity;
         let worstCaseEval = Infinity;
-        let firstMove = true;
+        const nextPlayer = player === 'white' ? 'black' : 'white';
 
         for (const move of moves) {
             const targetPiece = boardState[move.toRow][move.toCol];
@@ -1542,27 +1543,11 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
             const moveStr = toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol);
             const savedBranch = pushBranch(moveStr);
             const newBoard = makeTestMoveForPosition(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol);
-            const nextLine = searchLine.concat(moveStr);
-            
-            let evaluation;
-            if (firstMove) {
-                evaluation = minimaxWithRisk(newBoard, depth - 1, alpha, beta, false, nextPlayer, moveNumber + 1, trackWorstCase, nextLine);
-                firstMove = false;
-            } else {
-                const nullWindowResult = minimaxWithRisk(newBoard, depth - 1, alpha, alpha + 1, false, nextPlayer, moveNumber + 1, trackWorstCase, nextLine);
-                const nullWindowEval = typeof nullWindowResult === 'object' ? nullWindowResult.best : nullWindowResult;
-                if (nullWindowEval > alpha && nullWindowEval < beta) {
-                    evaluation = minimaxWithRisk(newBoard, depth - 1, alpha, beta, false, nextPlayer, moveNumber + 1, trackWorstCase, nextLine);
-                } else {
-                    evaluation = nullWindowResult;
-                }
-            }
-            
+            const evaluation = minimaxWithRisk(newBoard, depth - 1, alpha, beta, false, nextPlayer, moveNumber + 1, trackWorstCase);
             restoreBranch(savedBranch);
             let evalValue = typeof evaluation === 'object' ? evaluation.best : evaluation;
             
-            // Fix B: don't add captureSafety if score is already mate-bounded.
-            if (targetPiece && !isKingMove && Math.abs(evalValue) < MATE_BOUND) {
+            if (targetPiece && !isKingMove) {
                 const captureSafety = evaluateCaptureSafety(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol, player);
                 evalValue += captureSafety;
             }
@@ -1572,7 +1557,7 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
                 const worstVal = typeof evaluation === 'object' ? evaluation.worst : evaluation;
                 worstCaseEval = Math.min(worstCaseEval, worstVal);
             }
-            if (evalValue > alpha) alpha = evalValue;
+            alpha = Math.max(alpha, evalValue);
             if (beta <= alpha) {
                 if (!targetPiece) {
                     recordKillerMove(depth, move);
@@ -1585,7 +1570,7 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
     } else {
         let minEval = Infinity;
         let worstCaseEval = -Infinity;
-        let firstMove = true;
+        const nextPlayer = player === 'white' ? 'black' : 'white';
 
         for (const move of moves) {
             const targetPiece = boardState[move.toRow][move.toCol];
@@ -1610,27 +1595,11 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
             const moveStr = toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol);
             const savedBranch = pushBranch(moveStr);
             const newBoard = makeTestMoveForPosition(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol);
-            const nextLine = searchLine.concat(moveStr);
-            
-            let evaluation;
-            if (firstMove) {
-                evaluation = minimaxWithRisk(newBoard, depth - 1, alpha, beta, true, nextPlayer, moveNumber + 1, trackWorstCase, nextLine);
-                firstMove = false;
-            } else {
-                const nullWindowResult = minimaxWithRisk(newBoard, depth - 1, beta - 1, beta, true, nextPlayer, moveNumber + 1, trackWorstCase, nextLine);
-                const nullWindowEval = typeof nullWindowResult === 'object' ? nullWindowResult.best : nullWindowResult;
-                if (nullWindowEval < beta && nullWindowEval > alpha) {
-                    evaluation = minimaxWithRisk(newBoard, depth - 1, alpha, beta, true, nextPlayer, moveNumber + 1, trackWorstCase, nextLine);
-                } else {
-                    evaluation = nullWindowResult;
-                }
-            }
-            
+            const evaluation = minimaxWithRisk(newBoard, depth - 1, alpha, beta, true, nextPlayer, moveNumber + 1, trackWorstCase);
             restoreBranch(savedBranch);
             let evalValue = typeof evaluation === 'object' ? evaluation.best : evaluation;
             
-            // Fix B: don't subtract captureSafety if score is already mate-bounded.
-            if (targetPiece && !isKingMove && Math.abs(evalValue) < MATE_BOUND) {
+            if (targetPiece && !isKingMove) {
                 const captureSafety = evaluateCaptureSafety(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol, player);
                 evalValue -= captureSafety;
             }
@@ -1640,7 +1609,7 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
                 const worstVal = typeof evaluation === 'object' ? evaluation.worst : evaluation;
                 worstCaseEval = Math.max(worstCaseEval, worstVal);
             }
-            if (evalValue < beta) beta = evalValue;
+            beta = Math.min(beta, evalValue);
             if (beta <= alpha) {
                 if (!targetPiece) {
                     recordKillerMove(depth, move);
@@ -1689,16 +1658,13 @@ let riskAssessor = new RiskAssessment();
 
 function findBestMoveWithRiskAssessment() {
     setSearchPrefix(moveHistory.join("|"));
-    // Fix D: killers and history persist across moves within a game.
-    // They are only reset in newGame().
+    resetSearchHeuristics();
     
     const allMoves = getAllPossibleMoves(currentPlayer);
     if (allMoves.length === 0) return null;
     
     const opponentColor = currentPlayer === 'white' ? 'black' : 'white';
     const opponentIsMaximizing = (opponentColor === 'white');
-    
-    const rootSearchLine = moveHistory.slice();
     
     for (const move of allMoves) {
         const newBoard = makeTestMoveForPosition(board, move.fromRow, move.fromCol, move.toRow, move.toCol);
@@ -1741,11 +1707,6 @@ function findBestMoveWithRiskAssessment() {
         return 0;
     });
     
-    // Fix A: compute root eval once to determine desperation.
-    const rootEval = evaluatePositionForSearch(board, currentPlayer, moveCount, rootSearchLine);
-    const isDesperate = (currentPlayer === 'white' && rootEval < -500) ||
-                        (currentPlayer === 'black' && rootEval > 500);
-    
     const evaluatedMoves = [];
     
     for (const move of allMoves) {
@@ -1756,8 +1717,7 @@ function findBestMoveWithRiskAssessment() {
         
         const movingPieceRoot = board[move.fromRow][move.fromCol];
         const isKingMoveRoot = (movingPieceRoot === '♔' || movingPieceRoot === '♚');
-        if (!isKingMoveRoot && !isDesperate) {
-            // Fix A: only skip hanging moves when the position is roughly balanced.
+        if (!isKingMoveRoot) {
             const targetPieceForHungCheck = board[move.toRow][move.toCol];
             const targetValueForHungCheck = targetPieceForHungCheck ? (PIECE_VALUES[targetPieceForHungCheck] || 0) : 0;
             const hungValue = getHungPieceValue(board, move.fromRow, move.fromCol, move.toRow, move.toCol, currentPlayer);
@@ -1783,20 +1743,18 @@ function findBestMoveWithRiskAssessment() {
             const moveStr = toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol);
             const savedBranch = pushBranch(moveStr);
             const newBoard = makeTestMoveForPosition(board, move.fromRow, move.fromCol, move.toRow, move.toCol);
-            const childSearchLine = rootSearchLine.concat(moveStr);
             
             const bestResult = minimaxWithRisk(newBoard, searchDepth - 1, -Infinity, Infinity, opponentIsMaximizing, 
-                opponentColor, moveCount + 1, false, childSearchLine);
+                opponentColor, moveCount + 1, false);
             const worstResult = minimaxWithRisk(newBoard, searchDepth - 1, -Infinity, Infinity, opponentIsMaximizing, 
-                opponentColor, moveCount + 1, true, childSearchLine);
+                opponentColor, moveCount + 1, true);
             restoreBranch(savedBranch);
             
             const worstCase = typeof worstResult === 'object' ? worstResult.best : worstResult;
             let bestCase = typeof bestResult === 'object' ? bestResult.best : bestResult;
             
             const targetPiece = board[move.toRow][move.toCol];
-            // Fix B: don't add captureSafety if mate-bounded.
-            if (targetPiece && !isKingMoveRoot && Math.abs(bestCase) < MATE_BOUND) {
+            if (targetPiece && !isKingMoveRoot) {
                 const captureSafety = evaluateCaptureSafety(board, move.fromRow, move.fromCol, move.toRow, move.toCol, currentPlayer);
                 bestCase += captureSafety;
             }
@@ -1804,7 +1762,7 @@ function findBestMoveWithRiskAssessment() {
             evaluatedMoves.push({ move, bestCase, worstCase, depth: searchDepth });
             
             if (moveTree && SEARCH_CONFIG.useMemory) {
-                moveTree.storeMoveEvaluation(move, bestCase, searchDepth, [{ worst: worstCase }], false, true);
+                moveTree.storeMoveEvaluation(move, bestCase, searchDepth, [{ worst: worstCase }]);
             }
         }
     }
@@ -1814,9 +1772,8 @@ function findBestMoveWithRiskAssessment() {
             const moveStr = toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol);
             const savedBranch = pushBranch(moveStr);
             const newBoard = makeTestMoveForPosition(board, move.fromRow, move.fromCol, move.toRow, move.toCol);
-            const childSearchLine = rootSearchLine.concat(moveStr);
             const bestResult = minimaxWithRisk(newBoard, searchDepth - 1, -Infinity, Infinity, opponentIsMaximizing, 
-                opponentColor, moveCount + 1, false, childSearchLine);
+                opponentColor, moveCount + 1, false);
             restoreBranch(savedBranch);
             const bestCase = typeof bestResult === 'object' ? bestResult.best : bestResult;
             evaluatedMoves.push({ move, bestCase, worstCase: bestCase - 100, depth: searchDepth });
@@ -1842,8 +1799,6 @@ function findBestMoveWithRiskAssessment() {
     const searchTime = (performance.now() - searchStartTime).toFixed(0);
     const moveStr = toAlgebraicMove(bestSafeMove.move.fromRow, bestSafeMove.move.fromCol, bestSafeMove.move.toRow, bestSafeMove.move.toCol);
     console.log(`⏱️ ${searchTime}ms | Selected: ${moveStr} | Eval: ${bestSafeMove.bestCase} | Cache: ${LAYER_HITS}h/${LAYER_MISSES}m`);
-    
-    if (moveTree) moveTree.saveToStorage();
     
     return bestSafeMove.move;
 }
@@ -1889,7 +1844,8 @@ function handleSquareClick(row, col) {
         if (fromRow === row && fromCol === col) { clearSelection(); return; }
         if (isValidMove(fromRow, fromCol, row, col)) {
             makeMove(fromRow, fromCol, row, col);
-            clearSelection();
+            // makeMove already redrew the board; skip clearSelection's redundant redraw.
+            selectedSquare = null;
             switchPlayer();
             updateStatus();
             if (gameMode === 'ai' && !gameOver && currentPlayer !== humanPlayer) {
@@ -2267,7 +2223,7 @@ function updateAIStats() {
         winRate = Math.round((stats.whiteWins / stats.totalGames) * 100);
     }
     winRateElement.textContent = winRate;
-    if (difficultyElement) difficultyElement.textContent = `PMTS v${GAME_VERSION}`;
+    if (difficultyElement) difficultyElement.textContent = `PMTS v2.4.7`;
     if (versionElement) versionElement.textContent = `v${GAME_VERSION}`;
 }
 
@@ -2407,7 +2363,7 @@ function changeGameMode() {
     if (!gameModeSelect || !gameModeDisplay) return;
     gameMode = gameModeSelect.value;
     if (gameMode === 'ai') {
-        gameModeDisplay.textContent = `vs AI (v${GAME_VERSION})`;
+        gameModeDisplay.textContent = 'vs AI (v2.4.7)';
         if (aiInfo) aiInfo.style.display = 'block';
         if (currentPlayer === aiPlayer && !gameOver) setTimeout(makeAIMove, 500);
     } else {
@@ -2436,4 +2392,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - PVS + searchLine-threaded endgame check penalty + deferred localStorage`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - ASCII hashing + memoized defense/attacker + deferred localStorage`);
