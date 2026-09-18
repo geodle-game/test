@@ -1,9 +1,9 @@
 // chess-game.js
 // Enhanced chess game with dynamic piece activity + threat-based evaluation
-// VERSION: 2.4.7 - Castling in search, defense-aware LMP, refined quiet detection
+// VERSION: 2.5.0 - Time controls, iterative deepening, aspiration at root, SAN notation
 // COMPATIBLE WITH: chess-ai-database.js (v2.0) and chess-game-database.js (v1.1)
 
-const GAME_VERSION = "2.4.7";
+const GAME_VERSION = "2.5.0";
 
 // ========== GAME DATABASES ==========
 let openingBook = null;
@@ -319,6 +319,15 @@ let castlingRights = {
 let enPassantTarget = null;
 let enhancedAI = null;
 let endgameEngine = null;
+
+// ========== TIME CONTROL STATE ==========
+let timeControl = { initialMs: 300000, incrementMs: 0, unlimited: true };
+let whiteClockMs = 300000;
+let blackClockMs = 300000;
+let clockRunning = false;
+let clockInterval = null;
+let turnStartTime = 0;
+let flaggedPlayer = null;
 
 const pieceMap = {
     '♜': 'r', '♞': 'n', '♝': 'b', '♛': 'q', '♚': 'k', '♟': 'p',
@@ -1571,9 +1580,47 @@ const ASPIRATION = {
     maxDelta: 2000
 };
 
+// ========== TIME MANAGEMENT ==========
+const TIME_CONTROL = {
+    movesToGo: 30,
+    incrementFactor: 0.8,
+    minBudgetMs: 100,
+    maxBudgetMs: 5000,
+    maxBudgetFraction: 0.20,
+    hardMaxDepth: 6
+};
+
+let searchStartTime = 0;
+let searchDeadline = 0;
+let searchAborted = false;
+let nodesSearched = 0;
+
+function computeMoveBudget(remainingMs, incrementMs) {
+    if (remainingMs <= 0) return TIME_CONTROL.minBudgetMs;
+    let budget = remainingMs / TIME_CONTROL.movesToGo + incrementMs * TIME_CONTROL.incrementFactor;
+    budget = Math.min(budget, remainingMs * TIME_CONTROL.maxBudgetFraction);
+    budget = Math.max(budget, TIME_CONTROL.minBudgetMs);
+    budget = Math.min(budget, TIME_CONTROL.maxBudgetMs);
+    return budget;
+}
+
+function checkTimeOut() {
+    if (searchAborted) return true;
+    nodesSearched++;
+    if ((nodesSearched & 0x3FF) === 0) {
+        if (performance.now() > searchDeadline) {
+            searchAborted = true;
+            return true;
+        }
+    }
+    return false;
+}
+
 let transpositionTable = new Map();
 
 function quiescenceSearch(boardState, alpha, beta, player, qDepth) {
+    if (checkTimeOut()) return 0;
+    
     const moves = getAllPossibleMovesForPosition(boardState, player);
     if (moves.length === 0) {
         if (isKingInCheckForPosition(boardState, player)) {
@@ -1604,6 +1651,8 @@ function quiescenceSearch(boardState, alpha, beta, player, qDepth) {
     const opponent = player === 'white' ? 'black' : 'white';
     
     for (const move of candidateMoves) {
+        if (searchAborted) return alpha;
+        
         const movingPiece = boardState[move.fromRow][move.fromCol];
         const isKingMove = (movingPiece === '♔' || movingPiece === '♚');
         if (!inCheck && !isKingMove) {
@@ -1622,6 +1671,7 @@ function quiescenceSearch(boardState, alpha, beta, player, qDepth) {
 }
 
 function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, player, moveNumber) {
+    if (checkTimeOut()) return 0;
     if (!boardState) return 0;
     
     const moves = getAllPossibleMovesForPosition(boardState, player);
@@ -1667,6 +1717,8 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
         const nextPlayer = player === 'white' ? 'black' : 'white';
 
         for (const move of moves) {
+            if (searchAborted) return maxEval;
+            
             const targetPiece = boardState[move.toRow][move.toCol];
             const movingPiece = boardState[move.fromRow][move.fromCol];
             const isKingMove = (movingPiece === '♔' || movingPiece === '♚');
@@ -1713,6 +1765,8 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
         const nextPlayer = player === 'white' ? 'black' : 'white';
 
         for (const move of moves) {
+            if (searchAborted) return minEval;
+            
             const targetPiece = boardState[move.toRow][move.toCol];
             const movingPiece = boardState[move.fromRow][move.fromCol];
             const isKingMove = (movingPiece === '♔' || movingPiece === '♚');
@@ -1814,7 +1868,57 @@ let riskAssessor = new RiskAssessment();
 
 // ========== SEARCH ENTRY ==========
 
-function findBestMoveWithRiskAssessment() {
+function searchAllRootMoves(candidateMoves, depth, opponentColor, opponentIsMaximizing) {
+    const results = [];
+    let iterBestMove = null;
+    let iterBestEval = currentPlayer === 'white' ? -Infinity : Infinity;
+    let aborted = false;
+    const searchCenter = { value: 0, haveBaseline: false };
+    
+    for (const move of candidateMoves) {
+        if (searchAborted) { aborted = true; break; }
+        
+        const moveStr = toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol);
+        const savedBranch = pushBranch(moveStr);
+        const newBoard = makeTestMoveForPosition(board, move.fromRow, move.fromCol, move.toRow, move.toCol);
+        
+        let score;
+        if (!searchCenter.haveBaseline) {
+            score = minimaxWithRisk(newBoard, depth - 1, -Infinity, Infinity, opponentIsMaximizing,
+                opponentColor, moveCount + 1);
+            searchCenter.value = score;
+            searchCenter.haveBaseline = true;
+        } else {
+            const asp = searchRootMoveWithAspiration(newBoard, depth - 1, searchCenter.value,
+                opponentIsMaximizing, opponentColor, moveCount + 1);
+            score = asp.score;
+        }
+        restoreBranch(savedBranch);
+        
+        if (searchAborted) { aborted = true; break; }
+        
+        const targetPiece = board[move.toRow][move.toCol];
+        const movingPieceRoot = board[move.fromRow][move.fromCol];
+        const isKingMoveRoot = (movingPieceRoot === '♔' || movingPieceRoot === '♚');
+        let adjusted = score;
+        if (targetPiece && !isKingMoveRoot) {
+            const captureSafety = evaluateCaptureSafety(board, move.fromRow, move.fromCol, move.toRow, move.toCol, currentPlayer);
+            adjusted += captureSafety;
+        }
+        
+        results.push({ move, bestCase: adjusted, worstCase: adjusted - 100, depth });
+        
+        const isBetter = currentPlayer === 'white' ? adjusted > iterBestEval : adjusted < iterBestEval;
+        if (iterBestMove === null || isBetter) {
+            iterBestMove = move;
+            iterBestEval = adjusted;
+        }
+    }
+    
+    return { results, iterBestMove, iterBestEval, aborted };
+}
+
+function findBestMoveWithRiskAssessment(budgetMs) {
     setSearchPrefix(moveHistory.join("|"));
     resetSearchHeuristics();
     
@@ -1846,11 +1950,18 @@ function findBestMoveWithRiskAssessment() {
         }
     }
     
-    const isEndgame = isEndgamePositionForPosition(board);
-    const searchDepth = isEndgame ? SEARCH_CONFIG.endgameDepth : SEARCH_CONFIG.baseDepth;
+    const hasBudget = typeof budgetMs === 'number' && budgetMs > 0;
+    searchStartTime = performance.now();
+    searchDeadline = hasBudget ? searchStartTime + budgetMs : Infinity;
+    searchAborted = false;
+    nodesSearched = 0;
     
-    console.log(`🔍 ${currentPlayer.toUpperCase()} AI searching at depth ${searchDepth}${isEndgame ? ' (endgame)' : ''}`);
-    const searchStartTime = performance.now();
+    const isEndgame = isEndgamePositionForPosition(board);
+    const fixedDepth = isEndgame ? SEARCH_CONFIG.endgameDepth : SEARCH_CONFIG.baseDepth;
+    const startDepth = hasBudget ? 1 : fixedDepth;
+    const maxDepth = hasBudget ? TIME_CONTROL.hardMaxDepth : fixedDepth;
+    
+    console.log(`🔍 ${currentPlayer.toUpperCase()} AI searching ${hasBudget ? `(budget ${budgetMs.toFixed(0)}ms)` : `at depth ${fixedDepth}`}`);
     
     allMoves.sort((a, b) => {
         const targetA = board[a.toRow][a.toCol];
@@ -1865,10 +1976,7 @@ function findBestMoveWithRiskAssessment() {
         return 0;
     });
     
-    const evaluatedMoves = [];
-    let searchCenter = 0;
-    let haveBaseline = false;
-    
+    const candidateMoves = [];
     for (const move of allMoves) {
         if (isEndgame) {
             const candidateSAN = toSAN(board, move, currentPlayer);
@@ -1888,102 +1996,226 @@ function findBestMoveWithRiskAssessment() {
             }
         }
         
-        let cachedResult = null;
-        if (moveTree && SEARCH_CONFIG.useMemory) {
-            cachedResult = moveTree.getCachedEvaluation(move, board, currentPlayer, castlingRights, enPassantTarget);
+        candidateMoves.push(move);
+    }
+    
+    if (candidateMoves.length === 0) {
+        for (const m of allMoves) candidateMoves.push(m);
+    }
+    
+    let bestMove = candidateMoves[0];
+    let bestEval = 0;
+    let lastCompletedDepth = 0;
+    let finalResults = null;
+    
+    for (let depth = startDepth; depth <= maxDepth; depth++) {
+        if (searchAborted && depth > startDepth) break;
+        
+        const { results, iterBestMove, iterBestEval, aborted } = searchAllRootMoves(
+            candidateMoves, depth, opponentColor, opponentIsMaximizing
+        );
+        
+        if (aborted && depth > startDepth) break;
+        
+        if (iterBestMove) {
+            bestMove = iterBestMove;
+            bestEval = iterBestEval;
+            lastCompletedDepth = depth;
+            finalResults = results;
+            
+            results.sort((a, b) => currentPlayer === 'white' ? b.bestCase - a.bestCase : a.bestCase - b.bestCase);
+            candidateMoves.length = 0;
+            for (const r of results) candidateMoves.push(r.move);
         }
         
-        if (cachedResult) {
-            evaluatedMoves.push({
-                move,
-                bestCase: cachedResult.evaluation,
-                worstCase: cachedResult.evaluation - 100,
-                depth: cachedResult.depth
-            });
-            continue;
-        }
-        
-        const moveStr = toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol);
-        const savedBranch = pushBranch(moveStr);
-        const newBoard = makeTestMoveForPosition(board, move.fromRow, move.fromCol, move.toRow, move.toCol);
-        
-        let score;
-        let boundType;
-        
-        if (!haveBaseline) {
-            score = minimaxWithRisk(newBoard, searchDepth - 1, -Infinity, Infinity, opponentIsMaximizing,
-                opponentColor, moveCount + 1);
-            boundType = 'exact';
-            searchCenter = score;
-            haveBaseline = true;
+        if (searchAborted) break;
+    }
+    
+    if (finalResults && finalResults.length > 0) {
+        const riskAssessed = riskAssessor.assessLineRisk(finalResults);
+        let bestSafeMove;
+        if (currentPlayer === 'white') {
+            bestSafeMove = riskAssessor.findBestSafeMove(riskAssessed);
         } else {
-            const asp = searchRootMoveWithAspiration(newBoard, searchDepth - 1, searchCenter,
-                opponentIsMaximizing, opponentColor, moveCount + 1);
-            score = asp.score;
-            boundType = asp.boundType;
+            bestSafeMove = riskAssessed.reduce((best, current) => 
+                current.bestCase < best.bestCase ? current : best, riskAssessed[0]);
         }
-        
-        restoreBranch(savedBranch);
-        
-        let bestCase = score;
-        let worstCase;
-        
-        if (boundType === 'exact') {
-            worstCase = score;
-        } else {
-            worstCase = score - 100;
+        if (bestSafeMove) {
+            bestMove = bestSafeMove.move;
+            bestEval = bestSafeMove.bestCase;
         }
-        
-        const targetPiece = board[move.toRow][move.toCol];
-        if (targetPiece && !isKingMoveRoot) {
-            const captureSafety = evaluateCaptureSafety(board, move.fromRow, move.fromCol, move.toRow, move.toCol, currentPlayer);
-            bestCase += captureSafety;
-        }
-        
-        evaluatedMoves.push({ move, bestCase, worstCase, depth: searchDepth });
-        
-        if (moveTree && SEARCH_CONFIG.useMemory) {
-            moveTree.storeMoveEvaluation(move, bestCase, searchDepth, [{ worst: worstCase }]);
-        }
-    }
-    
-    if (evaluatedMoves.length === 0) {
-        for (const move of allMoves) {
-            const moveStr = toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol);
-            const savedBranch = pushBranch(moveStr);
-            const newBoard = makeTestMoveForPosition(board, move.fromRow, move.fromCol, move.toRow, move.toCol);
-            const score = minimaxWithRisk(newBoard, searchDepth - 1, -Infinity, Infinity, opponentIsMaximizing,
-                opponentColor, moveCount + 1);
-            restoreBranch(savedBranch);
-            evaluatedMoves.push({ move, bestCase: score, worstCase: score - 100, depth: searchDepth });
-        }
-    }
-    
-    if (currentPlayer === 'white') {
-        evaluatedMoves.sort((a, b) => b.bestCase - a.bestCase);
-    } else {
-        evaluatedMoves.sort((a, b) => a.bestCase - b.bestCase);
-    }
-    
-    const riskAssessed = riskAssessor.assessLineRisk(evaluatedMoves);
-    
-    let bestSafeMove;
-    if (currentPlayer === 'white') {
-        bestSafeMove = riskAssessor.findBestSafeMove(riskAssessed);
-    } else {
-        bestSafeMove = riskAssessed.reduce((best, current) => 
-            current.bestCase < best.bestCase ? current : best, riskAssessed[0]);
     }
     
     const searchTime = (performance.now() - searchStartTime).toFixed(0);
-    const displayMove = toSAN(board, bestSafeMove.move, currentPlayer);
-    console.log(`⏱️ ${searchTime}ms | Selected: ${displayMove} | Eval: ${bestSafeMove.bestCase} | Cache: ${LAYER_HITS}h/${LAYER_MISSES}m`);
+    const displayMove = toSAN(board, bestMove, currentPlayer);
+    console.log(`⏱️ ${searchTime}ms | Selected: ${displayMove} | Eval: ${bestEval} | Depth: ${lastCompletedDepth} | Cache: ${LAYER_HITS}h/${LAYER_MISSES}m`);
     
-    return bestSafeMove.move;
+    if (moveTree) moveTree.saveToStorage();
+    
+    return bestMove;
 }
 
 function findBestMove() {
-    return findBestMoveWithRiskAssessment();
+    if (timeControl.unlimited) {
+        return findBestMoveWithRiskAssessment(null);
+    }
+    const myClock = currentPlayer === 'white' ? whiteClockMs : blackClockMs;
+    const budget = computeMoveBudget(myClock, timeControl.incrementMs);
+    return findBestMoveWithRiskAssessment(budget);
+}
+
+// ========== TIME CONTROL FUNCTIONS ==========
+
+function formatClock(ms) {
+    if (ms < 0) ms = 0;
+    const totalSec = Math.ceil(ms / 1000);
+    const min = Math.floor(totalSec / 60);
+    const sec = totalSec % 60;
+    if (ms < 20000) {
+        const tenths = Math.floor((ms % 1000) / 100);
+        return `${min}:${sec.toString().padStart(2, '0')}.${tenths}`;
+    }
+    return `${min}:${sec.toString().padStart(2, '0')}`;
+}
+
+function updateClockDisplay() {
+    const whiteEl = document.getElementById('white-clock');
+    const blackEl = document.getElementById('black-clock');
+    if (!whiteEl || !blackEl) return;
+    
+    if (timeControl.unlimited) {
+        whiteEl.textContent = '∞';
+        blackEl.textContent = '∞';
+        whiteEl.classList.remove('active', 'low');
+        blackEl.classList.remove('active', 'low');
+        return;
+    }
+    
+    whiteEl.textContent = formatClock(whiteClockMs);
+    blackEl.textContent = formatClock(blackClockMs);
+    
+    const whiteActive = clockRunning && currentPlayer === 'white' && !gameOver;
+    const blackActive = clockRunning && currentPlayer === 'black' && !gameOver;
+    
+    whiteEl.classList.toggle('active', whiteActive);
+    blackEl.classList.toggle('active', blackActive);
+    whiteEl.classList.toggle('low', whiteClockMs < 20000 && !gameOver);
+    blackEl.classList.toggle('low', blackClockMs < 20000 && !gameOver);
+}
+
+function startClock() {
+    if (timeControl.unlimited || gameOver) return;
+    if (clockInterval) clearInterval(clockInterval);
+    clockRunning = true;
+    turnStartTime = performance.now();
+    clockInterval = setInterval(tickClock, 100);
+    updateClockDisplay();
+}
+
+function stopClock() {
+    if (clockInterval) {
+        clearInterval(clockInterval);
+        clockInterval = null;
+    }
+    clockRunning = false;
+}
+
+function tickClock() {
+    if (!clockRunning || gameOver || timeControl.unlimited) return;
+    
+    const now = performance.now();
+    const elapsed = now - turnStartTime;
+    turnStartTime = now;
+    
+    if (currentPlayer === 'white') {
+        whiteClockMs -= elapsed;
+        if (whiteClockMs <= 0) {
+            whiteClockMs = 0;
+            handleFlagFall('white');
+            return;
+        }
+    } else {
+        blackClockMs -= elapsed;
+        if (blackClockMs <= 0) {
+            blackClockMs = 0;
+            handleFlagFall('black');
+            return;
+        }
+    }
+    updateClockDisplay();
+}
+
+function handleFlagFall(player) {
+    stopClock();
+    gameOver = true;
+    flaggedPlayer = player;
+    const statusElement = document.getElementById('status');
+    if (statusElement) {
+        const winner = player === 'white' ? 'Black' : 'White';
+        statusElement.textContent = `${winner} wins on time!`;
+        statusElement.classList.add('checkmate');
+    }
+    updateClockDisplay();
+    console.log(`⏰ Flag fall: ${player} lost on time`);
+}
+
+function applyIncrement(player) {
+    if (timeControl.unlimited) return;
+    if (player === 'white') {
+        whiteClockMs += timeControl.incrementMs;
+    } else {
+        blackClockMs += timeControl.incrementMs;
+    }
+}
+
+function resetClocks() {
+    stopClock();
+    whiteClockMs = timeControl.initialMs;
+    blackClockMs = timeControl.initialMs;
+    flaggedPlayer = null;
+    updateClockDisplay();
+}
+
+function changeTimeControl() {
+    const select = document.getElementById('timeControl');
+    if (!select) return;
+    const value = select.value;
+    if (value === 'unlimited') {
+        timeControl = { initialMs: 0, incrementMs: 0, unlimited: true };
+    } else {
+        const [minPart, incPart] = value.split('+');
+        const minutes = parseFloat(minPart);
+        const incSec = parseFloat(incPart || '0');
+        timeControl = {
+            initialMs: minutes * 60000,
+            incrementMs: incSec * 1000,
+            unlimited: false
+        };
+    }
+    resetClocks();
+    if (!gameOver && !timeControl.unlimited) {
+        startClock();
+    }
+    console.log(`⏱️ Time control: ${value}`);
+}
+
+function afterMove() {
+    const mover = currentPlayer;
+    stopClock();
+    applyIncrement(mover);
+    switchPlayer();
+    updateStatus();
+    
+    if (gameOver) {
+        stopClock();
+        return;
+    }
+    
+    startClock();
+    
+    if (gameMode === 'ai' && currentPlayer === aiPlayer && !isThinking) {
+        setTimeout(makeAIMove, 300);
+    }
 }
 
 // ========== CORE GAME FUNCTIONS ==========
@@ -2024,11 +2256,7 @@ function handleSquareClick(row, col) {
         if (isValidMove(fromRow, fromCol, row, col)) {
             makeMove(fromRow, fromCol, row, col);
             selectedSquare = null;
-            switchPlayer();
-            updateStatus();
-            if (gameMode === 'ai' && !gameOver && currentPlayer !== humanPlayer) {
-                setTimeout(makeAIMove, 300);
-            }
+            afterMove();
         } else {
             if (piece && isPlayerPiece(piece, currentPlayer)) selectSquare(row, col);
             else clearSelection();
@@ -2199,7 +2427,9 @@ function makeMove(fromRow, fromCol, toRow, toCol) {
         halfMoveCount: halfMoveCount,
         castlingRights: { ...castlingRights },
         lastMove: lastMove,
-        enPassantTarget: enPassantTarget
+        enPassantTarget: enPassantTarget,
+        whiteClockMs: whiteClockMs,
+        blackClockMs: blackClockMs
     });
     
     lastMove = { fromRow, fromCol, toRow, toCol };
@@ -2243,7 +2473,6 @@ function makeMove(fromRow, fromCol, toRow, toCol) {
     moveHistory.push(sanMove);
     updateMoveHistory();
     
-    // Prune using coordinate-form active line, matching the cache's branch prefixes.
     pruneCachesToLine(moveTree ? moveTree.activeLineMoves : moveHistory);
     
     createBoard();
@@ -2376,16 +2605,22 @@ function makeAIMove() {
     
     setTimeout(() => {
         const bestMove = findBestMove();
-        if (bestMove) {
+        if (bestMove && !gameOver) {
             makeMove(bestMove.fromRow, bestMove.fromCol, bestMove.toRow, bestMove.toCol);
-            switchPlayer();
-            updateStatus();
-        }
-        isThinking = false;
-        if (thinkingElement) thinkingElement.style.display = 'none';
-        if (syncStatusElement) {
-            syncStatusElement.textContent = 'Ready';
-            syncStatusElement.classList.remove('thinking');
+            isThinking = false;
+            if (thinkingElement) thinkingElement.style.display = 'none';
+            if (syncStatusElement) {
+                syncStatusElement.textContent = 'Ready';
+                syncStatusElement.classList.remove('thinking');
+            }
+            afterMove();
+        } else {
+            isThinking = false;
+            if (thinkingElement) thinkingElement.style.display = 'none';
+            if (syncStatusElement) {
+                syncStatusElement.textContent = 'Ready';
+                syncStatusElement.classList.remove('thinking');
+            }
         }
     }, 300);
 }
@@ -2403,7 +2638,7 @@ function updateAIStats() {
         winRate = Math.round((stats.whiteWins / stats.totalGames) * 100);
     }
     winRateElement.textContent = winRate;
-    if (difficultyElement) difficultyElement.textContent = `PMTS v2.4.7`;
+    if (difficultyElement) difficultyElement.textContent = `PMTS v${GAME_VERSION}`;
     if (versionElement) versionElement.textContent = `v${GAME_VERSION}`;
 }
 
@@ -2454,6 +2689,7 @@ window.addEventListener('load', function() {
     updateAIStats();
     changeGameMode();
     displayVersion();
+    updateClockDisplay();
     
     console.log(`♔ Chess Game v${GAME_VERSION} Loaded! ♛`);
 });
@@ -2488,7 +2724,9 @@ function newGame() {
         blackKingside: true, blackQueenside: true
     };
     enPassantTarget = null;
+    flaggedPlayer = null;
     if (moveTree) moveTree.activeLineMoves = [];
+    resetClocks();
     createBoard();
     updateStatus();
     const moveListElement = document.getElementById('move-list');
@@ -2500,6 +2738,11 @@ function newGame() {
         syncStatusElement.textContent = 'Ready';
         syncStatusElement.classList.remove('thinking');
     }
+    
+    if (!timeControl.unlimited) {
+        startClock();
+    }
+    
     if (gameMode === 'ai' && humanPlayer === 'black' && currentPlayer === 'white') {
         setTimeout(makeAIMove, 500);
     }
@@ -2516,23 +2759,31 @@ function undoMove() {
     castlingRights = previousState.castlingRights;
     lastMove = previousState.lastMove;
     enPassantTarget = previousState.enPassantTarget;
+    if (typeof previousState.whiteClockMs === 'number') whiteClockMs = previousState.whiteClockMs;
+    if (typeof previousState.blackClockMs === 'number') blackClockMs = previousState.blackClockMs;
     gameOver = false;
+    flaggedPlayer = null;
     if (moveTree) moveTree.activeLineMoves.pop();
     
-    // Prune using coordinate-form active line, matching the cache's branch prefixes.
+    stopClock();
     pruneCachesToLine(moveTree ? moveTree.activeLineMoves : moveHistory);
     
     createBoard();
     updateStatus();
     updateMoveHistory();
+    updateClockDisplay();
     const statusElement = document.getElementById('status');
     if (statusElement) statusElement.classList.remove('checkmate', 'check');
+    
+    if (!timeControl.unlimited && !gameOver) {
+        startClock();
+    }
 }
 
 function switchSides() {
     humanPlayer = humanPlayer === 'white' ? 'black' : 'white';
     aiPlayer = humanPlayer === 'white' ? 'black' : 'white';
-    if (gameMode === 'ai' && currentPlayer === aiPlayer && !gameOver) {
+    if (gameMode === 'ai' && currentPlayer === aiPlayer && !gameOver && !isThinking) {
         setTimeout(makeAIMove, 500);
     }
 }
@@ -2544,9 +2795,9 @@ function changeGameMode() {
     if (!gameModeSelect || !gameModeDisplay) return;
     gameMode = gameModeSelect.value;
     if (gameMode === 'ai') {
-        gameModeDisplay.textContent = 'vs AI (v2.4.7)';
+        gameModeDisplay.textContent = `vs AI (v${GAME_VERSION})`;
         if (aiInfo) aiInfo.style.display = 'block';
-        if (currentPlayer === aiPlayer && !gameOver) setTimeout(makeAIMove, 500);
+        if (currentPlayer === aiPlayer && !gameOver && !isThinking) setTimeout(makeAIMove, 500);
     } else {
         gameModeDisplay.textContent = 'vs Player';
         if (aiInfo) aiInfo.style.display = 'none';
@@ -2570,7 +2821,8 @@ if (typeof window !== 'undefined') {
     window.undoMove = undoMove;
     window.switchSides = switchSides;
     window.changeGameMode = changeGameMode;
+    window.changeTimeControl = changeTimeControl;
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - SAN notation, aspiration at root, coordinate-aligned cache pruning`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - time controls, iterative deepening, SAN notation`);
