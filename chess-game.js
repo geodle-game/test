@@ -1608,6 +1608,33 @@ function checkTimeOut() {
     if (searchAborted) return true;
     nodesSearched++;
     if ((nodesSearched & 0x3FF) === 0) {
+        // The event loop is blocked during search, so tickClock cannot fire.
+        // Update the active player's clock inline here instead.
+        if (!timeControl.unlimited && clockRunning && !gameOver) {
+            const now = performance.now();
+            const elapsed = now - turnStartTime;
+            turnStartTime = now;
+            
+            if (currentPlayer === 'white') {
+                whiteClockMs -= elapsed;
+                if (whiteClockMs <= 0) {
+                    whiteClockMs = 0;
+                    updateClockDisplay();
+                    searchAborted = true;
+                    return true;
+                }
+            } else {
+                blackClockMs -= elapsed;
+                if (blackClockMs <= 0) {
+                    blackClockMs = 0;
+                    updateClockDisplay();
+                    searchAborted = true;
+                    return true;
+                }
+            }
+            updateClockDisplay();
+        }
+        
         if (performance.now() > searchDeadline) {
             searchAborted = true;
             return true;
@@ -2632,6 +2659,20 @@ function makeAIMove() {
     
     setTimeout(() => {
         const bestMove = findBestMove();
+        
+        // Check if we flagged during the search — if so, don't play the move.
+        const myClock = currentPlayer === 'white' ? whiteClockMs : blackClockMs;
+        if (!timeControl.unlimited && myClock <= 0) {
+            isThinking = false;
+            if (thinkingElement) thinkingElement.style.display = 'none';
+            if (syncStatusElement) {
+                syncStatusElement.textContent = 'Ready';
+                syncStatusElement.classList.remove('thinking');
+            }
+            handleFlagFall(currentPlayer);
+            return;
+        }
+        
         if (bestMove && !gameOver) {
             makeMove(bestMove.fromRow, bestMove.fromCol, bestMove.toRow, bestMove.toCol);
             isThinking = false;
