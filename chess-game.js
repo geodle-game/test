@@ -336,6 +336,170 @@ const PIECE_VALUES = {
     '': 0
 };
 
+// ========== STANDARD ALGEBRAIC NOTATION (SAN) ==========
+
+const SAN_PIECE_LETTER = {
+    '♔': 'K', '♕': 'Q', '♖': 'R', '♗': 'B', '♘': 'N',
+    '♚': 'K', '♛': 'Q', '♜': 'R', '♝': 'B', '♞': 'N',
+    '♙': '', '♟': ''
+};
+
+function squareName(row, col) {
+    const files = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
+    const ranks = ['8', '7', '6', '5', '4', '3', '2', '1'];
+    return files[col] + ranks[row];
+}
+
+/**
+ * Generate SAN string for a single move without mutating the board.
+ * @param {Array} boardState  board BEFORE the move is applied
+ * @param {Object} move       { fromRow, fromCol, toRow, toCol }
+ * @param {String} player     'white' or 'black'
+ * @returns {String}          SAN, e.g. "Nf3", "exd5", "O-O", "e8=Q+"
+ */
+function toSAN(boardState, move, player) {
+    if (!boardState || !move) return '?';
+    
+    const piece = boardState[move.fromRow][move.fromCol];
+    if (!piece) return '?';
+    
+    const pieceCode = pieceMap[piece] || '';
+    const isPawn = pieceCode.toLowerCase() === 'p';
+    const isKing = pieceCode.toLowerCase() === 'k';
+    const targetPiece = boardState[move.toRow][move.toCol];
+    
+    // ---- Castling ----
+    if (isKing && Math.abs(move.toCol - move.fromCol) === 2 && move.fromRow === move.toRow) {
+        const isKingside = move.toCol > move.fromCol;
+        let san = isKingside ? 'O-O' : 'O-O-O';
+        san += getCheckSuffix(boardState, move, player);
+        return san;
+    }
+    
+    // ---- Build piece prefix + destination ----
+    const dest = squareName(move.toRow, move.toCol);
+    let san = '';
+    
+    if (isPawn) {
+        // Pawn capture: file letter of departure + 'x' + destination
+        if (targetPiece) {
+            san += squareName(move.fromRow, move.fromCol)[0] + 'x' + dest;
+        } else if (enPassantCapture(boardState, move, player)) {
+            // En passant is a capture even though destination square is empty
+            san += squareName(move.fromRow, move.fromCol)[0] + 'x' + dest;
+        } else {
+            san += dest;
+        }
+        
+        // Promotion
+        if (move.toRow === 0 || move.toRow === 7) {
+            // We don't know which piece; game always promotes to queen in makeMove
+            san += '=Q';
+        }
+    } else {
+        // Non-pawn: piece letter, disambiguation, capture marker, destination
+        const pieceLetter = SAN_PIECE_LETTER[piece] || '';
+        san += pieceLetter;
+        
+        // Disambiguation: find other same-type pieces that can also legally move to dest
+        const samePieces = [];
+        for (let r = 0; r < 8; r++) {
+            for (let c = 0; c < 8; c++) {
+                if (r === move.fromRow && c === move.fromCol) continue;
+                const other = boardState[r][c];
+                if (!other) continue;
+                if (other !== piece) continue;  // same exact glyph
+                // Would this other piece be able to move to dest?
+                if (canPieceLegallyReach(boardState, r, c, move.toRow, move.toCol, player)) {
+                    samePieces.push({ row: r, col: c });
+                }
+            }
+        }
+        
+        if (samePieces.length > 0) {
+            const sameFile = samePieces.some(p => p.col === move.fromCol);
+            const sameRank = samePieces.some(p => p.row === move.fromRow);
+            if (!sameFile) {
+                san += squareName(move.fromRow, move.fromCol)[0];  // file only
+            } else if (!sameRank) {
+                san += squareName(move.fromRow, move.fromCol)[1];  // rank only
+            } else {
+                san += squareName(move.fromRow, move.fromCol);     // full square
+            }
+        }
+        
+        if (targetPiece) san += 'x';
+        san += dest;
+    }
+    
+    // ---- Check / checkmate suffix ----
+    san += getCheckSuffix(boardState, move, player);
+    
+    return san;
+}
+
+function enPassantCapture(boardState, move, player) {
+    const piece = boardState[move.fromRow][move.fromCol];
+    const pieceCode = pieceMap[piece] || '';
+    if (pieceCode.toLowerCase() !== 'p') return false;
+    if (move.fromCol === move.toCol) return false;    // not a diagonal
+    if (boardState[move.toRow][move.toCol]) return false;  // destination occupied (normal capture)
+    // Diagonal pawn move to empty square = en passant
+    return true;
+}
+
+/**
+ * Check if a piece at (fromRow, fromCol) can legally reach (toRow, toCol)
+ * on the given board. Used for SAN disambiguation. Does NOT consider castling.
+ */
+function canPieceLegallyReach(boardState, fromRow, fromCol, toRow, toCol, player) {
+    const piece = boardState[fromRow][fromCol];
+    if (!piece) return false;
+    const pieceCode = pieceMap[piece];
+    if (!pieceCode) return false;
+    
+    const dx = toCol - fromCol;
+    const dy = toRow - fromRow;
+    const absDx = Math.abs(dx);
+    const absDy = Math.abs(dy);
+    
+    switch (pieceCode.toLowerCase()) {
+        case 'r':
+            if (!((dx === 0 || dy === 0) && isPathClearForPosition(boardState, fromRow, fromCol, toRow, toCol))) return false;
+            break;
+        case 'n':
+            if (!((absDx === 2 && absDy === 1) || (absDx === 1 && absDy === 2))) return false;
+            break;
+        case 'b':
+            if (!(absDx === absDy && isPathClearForPosition(boardState, fromRow, fromCol, toRow, toCol))) return false;
+            break;
+        case 'q':
+            if (!((dx === 0 || dy === 0 || absDx === absDy) && isPathClearForPosition(boardState, fromRow, fromCol, toRow, toCol))) return false;
+            break;
+        default:
+            return false;
+    }
+    
+    // Reject if the move would leave own king in check
+    if (wouldKingBeInCheckAfter(boardState, fromRow, fromCol, toRow, toCol, player)) return false;
+    return true;
+}
+
+/**
+ * Append '+' if the move gives check, '#' if it gives checkmate.
+ * Applies the move temporarily to test.
+ */
+function getCheckSuffix(boardState, move, player) {
+    const opponent = player === 'white' ? 'black' : 'white';
+    const newBoard = makeTestMoveForPosition(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol);
+    if (!newBoard) return '';
+    if (!isKingInCheckForPosition(newBoard, opponent)) return '';
+    // Checkmate = opponent has no legal moves after this
+    const opponentMoves = getAllPossibleMovesForPosition(newBoard, opponent);
+    if (opponentMoves.length === 0) return '#';
+    return '+';
+}
+
 // ========== ENDGAME CHECK PREVENTION ==========
 
 function isEndlessCheck(moveHistory, player) {
@@ -1423,7 +1587,6 @@ const SEARCH_CONFIG = {
     quiescenceDepth: 2
 };
 
-// Aspiration window settings (used only at root)
 const ASPIRATION = {
     initialDelta: 50,
     maxDelta: 2000
@@ -1617,13 +1780,6 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
 
 // ========== ASPIRATION SEARCH AT ROOT ==========
 
-/**
- * Search a root move with an aspiration window centered on `center`.
- * Returns { score, boundType } where boundType is:
- *   'exact'    — score is the true minimax value
- *   'upper'    — score is an upper bound (true value is <= score)
- *   'lower'    — score is a lower bound (true value is >= score)
- */
 function searchRootMoveWithAspiration(newBoard, depth, center, opponentIsMaximizing, opponentColor, moveCount) {
     let delta = ASPIRATION.initialDelta;
     
@@ -1641,7 +1797,6 @@ function searchRootMoveWithAspiration(newBoard, depth, center, opponentIsMaximiz
         return { score, boundType: 'exact' };
     }
     
-    // Fallback: full window
     const score = minimaxWithRisk(newBoard, depth, -Infinity, Infinity, opponentIsMaximizing, opponentColor, moveCount);
     return { score, boundType: 'exact' };
 }
@@ -1695,7 +1850,7 @@ function findBestMoveWithRiskAssessment() {
         if (newBoard && isKingInCheckForPosition(newBoard, opponentColor)) {
             const opponentMoves = getAllPossibleMovesForPosition(newBoard, opponentColor);
             if (opponentMoves.length === 0) {
-                console.log(`👑 Immediate mate found: ${toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol)}`);
+                console.log(`👑 Immediate mate found: ${toSAN(board, move, currentPlayer)}`);
                 return move;
             }
         }
@@ -1732,12 +1887,15 @@ function findBestMoveWithRiskAssessment() {
     });
     
     const evaluatedMoves = [];
-    let searchCenter = 0;          // updated as we learn from each move
+    let searchCenter = 0;
     let haveBaseline = false;
     
     for (const move of allMoves) {
         if (isEndgame) {
-            const testHistory = [...moveHistory, toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol)];
+            // Pre-filter moves that perpetuate endless checks. Use SAN for candidate to
+            // correctly detect '+'/'#' markers.
+            const candidateSAN = toSAN(board, move, currentPlayer);
+            const testHistory = [...moveHistory, candidateSAN];
             if (isEndlessCheck(testHistory, currentPlayer)) continue;
         }
         
@@ -1748,7 +1906,7 @@ function findBestMoveWithRiskAssessment() {
             const targetValueForHungCheck = targetPieceForHungCheck ? (PIECE_VALUES[targetPieceForHungCheck] || 0) : 0;
             const hungValue = getHungPieceValue(board, move.fromRow, move.fromCol, move.toRow, move.toCol, currentPlayer);
             if (hungValue > targetValueForHungCheck + 200) {
-                console.log(`⏭️ Skipping ${toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol)} (hangs ${hungValue})`);
+                console.log(`⏭️ Skipping ${toSAN(board, move, currentPlayer)} (hangs ${hungValue})`);
                 continue;
             }
         }
@@ -1765,7 +1923,6 @@ function findBestMoveWithRiskAssessment() {
                 worstCase: cachedResult.evaluation - 100,
                 depth: cachedResult.depth
             });
-            // Don't update searchCenter from cached — it may be stale.
             continue;
         }
         
@@ -1777,7 +1934,6 @@ function findBestMoveWithRiskAssessment() {
         let boundType;
         
         if (!haveBaseline) {
-            // First move: full window to establish a reliable baseline.
             score = minimaxWithRisk(newBoard, searchDepth - 1, -Infinity, Infinity, opponentIsMaximizing,
                 opponentColor, moveCount + 1);
             boundType = 'exact';
@@ -1797,17 +1953,10 @@ function findBestMoveWithRiskAssessment() {
         
         if (boundType === 'exact') {
             worstCase = score;
-        } else if (boundType === 'upper') {
-            // score is an upper bound — true value is <= score
-            bestCase = score;
-            worstCase = score - 100;   // conservative slack
         } else {
-            // 'lower' — true value is >= score
-            bestCase = score;
             worstCase = score - 100;
         }
         
-        // Add capture bonus to bestCase, but keep worstCase as the raw search bound.
         const targetPiece = board[move.toRow][move.toCol];
         if (targetPiece && !isKingMoveRoot) {
             const captureSafety = evaluateCaptureSafety(board, move.fromRow, move.fromCol, move.toRow, move.toCol, currentPlayer);
@@ -1822,7 +1971,6 @@ function findBestMoveWithRiskAssessment() {
     }
     
     if (evaluatedMoves.length === 0) {
-        // Fallback: no moves passed the hung-piece filter. Search them all with full window.
         for (const move of allMoves) {
             const moveStr = toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol);
             const savedBranch = pushBranch(moveStr);
@@ -1851,8 +1999,8 @@ function findBestMoveWithRiskAssessment() {
     }
     
     const searchTime = (performance.now() - searchStartTime).toFixed(0);
-    const moveStr = toAlgebraicMove(bestSafeMove.move.fromRow, bestSafeMove.move.fromCol, bestSafeMove.move.toRow, bestSafeMove.move.toCol);
-    console.log(`⏱️ ${searchTime}ms | Selected: ${moveStr} | Eval: ${bestSafeMove.bestCase} | Cache: ${LAYER_HITS}h/${LAYER_MISSES}m`);
+    const displayMove = toSAN(board, bestSafeMove.move, currentPlayer);
+    console.log(`⏱️ ${searchTime}ms | Selected: ${displayMove} | Eval: ${bestSafeMove.bestCase} | Cache: ${LAYER_HITS}h/${LAYER_MISSES}m`);
     
     return bestSafeMove.move;
 }
@@ -2078,8 +2226,12 @@ function makeMove(fromRow, fromCol, toRow, toCol) {
     });
     
     lastMove = { fromRow, fromCol, toRow, toCol };
-    const algebraicMove = toAlgebraicMove(fromRow, fromCol, toRow, toCol);
-    if (moveTree) moveTree.activeLineMoves.push(algebraicMove);
+    
+    // Compute SAN BEFORE mutating the board (needs to inspect the current position).
+    const sanMove = toSAN(board, { fromRow, fromCol, toRow, toCol }, currentPlayer);
+    const coordinateMove = toAlgebraicMove(fromRow, fromCol, toRow, toCol);
+    
+    if (moveTree) moveTree.activeLineMoves.push(coordinateMove);
     
     if ((piece === '♙' || piece === '♟') && enPassantTarget && 
         toRow === enPassantTarget.row && toCol === enPassantTarget.col) {
@@ -2112,7 +2264,7 @@ function makeMove(fromRow, fromCol, toRow, toCol) {
     updateHalfMoveClock(piece, capturedPiece);
     if (currentPlayer === 'black') moveCount++;
     
-    moveHistory.push(algebraicMove);
+    moveHistory.push(sanMove);
     updateMoveHistory();
     
     pruneCachesToLine(moveHistory);
@@ -2210,9 +2362,9 @@ function updateMoveHistory() {
         const moveNumber = Math.floor(i / 2) + 1;
         const whiteMove = moveHistory[i] || '';
         const blackMove = moveHistory[i + 1] || '';
-        formattedMoves.push(`${moveNumber}. ${whiteMove} ${blackMove}`);
+        formattedMoves.push(`${moveNumber}. ${whiteMove}${blackMove ? ' ' + blackMove : ''}`);
     }
-    moveListElement.textContent = formattedMoves.join(' ');
+    moveListElement.textContent = formattedMoves.join(' ') || 'Game ready to start';
 }
 
 function parseAlgebraicMove(moveStr) {
@@ -2227,9 +2379,7 @@ function parseAlgebraicMove(moveStr) {
 }
 
 function toAlgebraicMove(fromRow, fromCol, toRow, toCol) {
-    const files = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
-    const ranks = ['8', '7', '6', '5', '4', '3', '2', '1'];
-    return files[fromCol] + ranks[fromRow] + files[toCol] + ranks[toRow];
+    return squareName(fromRow, fromCol) + squareName(toRow, toCol);
 }
 
 // ========== AI MOVE EXECUTION ==========
@@ -2445,4 +2595,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - aspiration at root, single search per move`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - SAN notation for display, aspiration at root`);
