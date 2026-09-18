@@ -213,7 +213,6 @@ class PersistentMoveTree {
         
         this.tree.set(key, node);
         if (positionHash !== "empty") this.positionCache.set(positionHash, node);
-        // Save deferred: persistence happens once per real move via pruneInactiveLines.
         return node;
     }
 
@@ -1424,6 +1423,12 @@ const SEARCH_CONFIG = {
     quiescenceDepth: 2
 };
 
+// Aspiration window settings (used only at root)
+const ASPIRATION = {
+    initialDelta: 50,
+    maxDelta: 2000
+};
+
 let transpositionTable = new Map();
 
 function quiescenceSearch(boardState, alpha, beta, player, qDepth) {
@@ -1474,7 +1479,7 @@ function quiescenceSearch(boardState, alpha, beta, player, qDepth) {
     return alpha;
 }
 
-function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, player, moveNumber, trackWorstCase = false) {
+function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, player, moveNumber) {
     if (!boardState) return 0;
     
     const moves = getAllPossibleMovesForPosition(boardState, player);
@@ -1517,7 +1522,6 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
 
     if (isMaximizingPlayer) {
         let maxEval = -Infinity;
-        let worstCaseEval = Infinity;
         const nextPlayer = player === 'white' ? 'black' : 'white';
 
         for (const move of moves) {
@@ -1543,21 +1547,16 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
             const moveStr = toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol);
             const savedBranch = pushBranch(moveStr);
             const newBoard = makeTestMoveForPosition(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol);
-            const evaluation = minimaxWithRisk(newBoard, depth - 1, alpha, beta, false, nextPlayer, moveNumber + 1, trackWorstCase);
+            let evalValue = minimaxWithRisk(newBoard, depth - 1, alpha, beta, false, nextPlayer, moveNumber + 1);
             restoreBranch(savedBranch);
-            let evalValue = typeof evaluation === 'object' ? evaluation.best : evaluation;
             
             if (targetPiece && !isKingMove) {
                 const captureSafety = evaluateCaptureSafety(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol, player);
                 evalValue += captureSafety;
             }
             
-            maxEval = Math.max(maxEval, evalValue);
-            if (trackWorstCase) {
-                const worstVal = typeof evaluation === 'object' ? evaluation.worst : evaluation;
-                worstCaseEval = Math.min(worstCaseEval, worstVal);
-            }
-            alpha = Math.max(alpha, evalValue);
+            if (evalValue > maxEval) maxEval = evalValue;
+            if (evalValue > alpha) alpha = evalValue;
             if (beta <= alpha) {
                 if (!targetPiece) {
                     recordKillerMove(depth, move);
@@ -1566,10 +1565,9 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
                 break;
             }
         }
-        return trackWorstCase ? { best: maxEval, worst: worstCaseEval } : maxEval;
+        return maxEval;
     } else {
         let minEval = Infinity;
-        let worstCaseEval = -Infinity;
         const nextPlayer = player === 'white' ? 'black' : 'white';
 
         for (const move of moves) {
@@ -1595,21 +1593,16 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
             const moveStr = toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol);
             const savedBranch = pushBranch(moveStr);
             const newBoard = makeTestMoveForPosition(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol);
-            const evaluation = minimaxWithRisk(newBoard, depth - 1, alpha, beta, true, nextPlayer, moveNumber + 1, trackWorstCase);
+            let evalValue = minimaxWithRisk(newBoard, depth - 1, alpha, beta, true, nextPlayer, moveNumber + 1);
             restoreBranch(savedBranch);
-            let evalValue = typeof evaluation === 'object' ? evaluation.best : evaluation;
             
             if (targetPiece && !isKingMove) {
                 const captureSafety = evaluateCaptureSafety(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol, player);
                 evalValue -= captureSafety;
             }
             
-            minEval = Math.min(minEval, evalValue);
-            if (trackWorstCase) {
-                const worstVal = typeof evaluation === 'object' ? evaluation.worst : evaluation;
-                worstCaseEval = Math.max(worstCaseEval, worstVal);
-            }
-            beta = Math.min(beta, evalValue);
+            if (evalValue < minEval) minEval = evalValue;
+            if (evalValue < beta) beta = evalValue;
             if (beta <= alpha) {
                 if (!targetPiece) {
                     recordKillerMove(depth, move);
@@ -1618,8 +1611,39 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
                 break;
             }
         }
-        return trackWorstCase ? { best: minEval, worst: worstCaseEval } : minEval;
+        return minEval;
     }
+}
+
+// ========== ASPIRATION SEARCH AT ROOT ==========
+
+/**
+ * Search a root move with an aspiration window centered on `center`.
+ * Returns { score, boundType } where boundType is:
+ *   'exact'    — score is the true minimax value
+ *   'upper'    — score is an upper bound (true value is <= score)
+ *   'lower'    — score is a lower bound (true value is >= score)
+ */
+function searchRootMoveWithAspiration(newBoard, depth, center, opponentIsMaximizing, opponentColor, moveCount) {
+    let delta = ASPIRATION.initialDelta;
+    
+    while (delta <= ASPIRATION.maxDelta) {
+        const alpha = center - delta;
+        const beta = center + delta;
+        const score = minimaxWithRisk(newBoard, depth, alpha, beta, opponentIsMaximizing, opponentColor, moveCount);
+        
+        if (score <= alpha) {
+            return { score, boundType: 'upper' };
+        }
+        if (score >= beta) {
+            return { score, boundType: 'lower' };
+        }
+        return { score, boundType: 'exact' };
+    }
+    
+    // Fallback: full window
+    const score = minimaxWithRisk(newBoard, depth, -Infinity, Infinity, opponentIsMaximizing, opponentColor, moveCount);
+    return { score, boundType: 'exact' };
 }
 
 // ========== RISK ASSESSMENT ==========
@@ -1708,6 +1732,8 @@ function findBestMoveWithRiskAssessment() {
     });
     
     const evaluatedMoves = [];
+    let searchCenter = 0;          // updated as we learn from each move
+    let haveBaseline = false;
     
     for (const move of allMoves) {
         if (isEndgame) {
@@ -1739,44 +1765,72 @@ function findBestMoveWithRiskAssessment() {
                 worstCase: cachedResult.evaluation - 100,
                 depth: cachedResult.depth
             });
+            // Don't update searchCenter from cached — it may be stale.
+            continue;
+        }
+        
+        const moveStr = toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol);
+        const savedBranch = pushBranch(moveStr);
+        const newBoard = makeTestMoveForPosition(board, move.fromRow, move.fromCol, move.toRow, move.toCol);
+        
+        let score;
+        let boundType;
+        
+        if (!haveBaseline) {
+            // First move: full window to establish a reliable baseline.
+            score = minimaxWithRisk(newBoard, searchDepth - 1, -Infinity, Infinity, opponentIsMaximizing,
+                opponentColor, moveCount + 1);
+            boundType = 'exact';
+            searchCenter = score;
+            haveBaseline = true;
         } else {
-            const moveStr = toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol);
-            const savedBranch = pushBranch(moveStr);
-            const newBoard = makeTestMoveForPosition(board, move.fromRow, move.fromCol, move.toRow, move.toCol);
-            
-            // Single search with trackWorstCase=true — returns { best, worst }.
-            const result = minimaxWithRisk(newBoard, searchDepth - 1, -Infinity, Infinity, opponentIsMaximizing, 
-                opponentColor, moveCount + 1, true);
-            restoreBranch(savedBranch);
-            
-            let bestCase = typeof result === 'object' ? result.best : result;
-            const worstCase = typeof result === 'object' ? result.worst : result;
-            
-            const targetPiece = board[move.toRow][move.toCol];
-            if (targetPiece && !isKingMoveRoot) {
-                const captureSafety = evaluateCaptureSafety(board, move.fromRow, move.fromCol, move.toRow, move.toCol, currentPlayer);
-                bestCase += captureSafety;
-            }
-            
-            evaluatedMoves.push({ move, bestCase, worstCase, depth: searchDepth });
-            
-            if (moveTree && SEARCH_CONFIG.useMemory) {
-                moveTree.storeMoveEvaluation(move, bestCase, searchDepth, [{ worst: worstCase }]);
-            }
+            const asp = searchRootMoveWithAspiration(newBoard, searchDepth - 1, searchCenter,
+                opponentIsMaximizing, opponentColor, moveCount + 1);
+            score = asp.score;
+            boundType = asp.boundType;
+        }
+        
+        restoreBranch(savedBranch);
+        
+        let bestCase = score;
+        let worstCase;
+        
+        if (boundType === 'exact') {
+            worstCase = score;
+        } else if (boundType === 'upper') {
+            // score is an upper bound — true value is <= score
+            bestCase = score;
+            worstCase = score - 100;   // conservative slack
+        } else {
+            // 'lower' — true value is >= score
+            bestCase = score;
+            worstCase = score - 100;
+        }
+        
+        // Add capture bonus to bestCase, but keep worstCase as the raw search bound.
+        const targetPiece = board[move.toRow][move.toCol];
+        if (targetPiece && !isKingMoveRoot) {
+            const captureSafety = evaluateCaptureSafety(board, move.fromRow, move.fromCol, move.toRow, move.toCol, currentPlayer);
+            bestCase += captureSafety;
+        }
+        
+        evaluatedMoves.push({ move, bestCase, worstCase, depth: searchDepth });
+        
+        if (moveTree && SEARCH_CONFIG.useMemory) {
+            moveTree.storeMoveEvaluation(move, bestCase, searchDepth, [{ worst: worstCase }]);
         }
     }
     
     if (evaluatedMoves.length === 0) {
+        // Fallback: no moves passed the hung-piece filter. Search them all with full window.
         for (const move of allMoves) {
             const moveStr = toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol);
             const savedBranch = pushBranch(moveStr);
             const newBoard = makeTestMoveForPosition(board, move.fromRow, move.fromCol, move.toRow, move.toCol);
-            const result = minimaxWithRisk(newBoard, searchDepth - 1, -Infinity, Infinity, opponentIsMaximizing, 
-                opponentColor, moveCount + 1, true);
+            const score = minimaxWithRisk(newBoard, searchDepth - 1, -Infinity, Infinity, opponentIsMaximizing,
+                opponentColor, moveCount + 1);
             restoreBranch(savedBranch);
-            const bestCase = typeof result === 'object' ? result.best : result;
-            const worstCase = typeof result === 'object' ? result.worst : result;
-            evaluatedMoves.push({ move, bestCase, worstCase, depth: searchDepth });
+            evaluatedMoves.push({ move, bestCase: score, worstCase: score - 100, depth: searchDepth });
         }
     }
     
@@ -2391,4 +2445,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - single-search risk assessment + deferred localStorage`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - aspiration at root, single search per move`);
