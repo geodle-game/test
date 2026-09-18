@@ -368,7 +368,6 @@ function toSAN(boardState, move, player) {
     const isKing = pieceCode.toLowerCase() === 'k';
     const targetPiece = boardState[move.toRow][move.toCol];
     
-    // ---- Castling ----
     if (isKing && Math.abs(move.toCol - move.fromCol) === 2 && move.fromRow === move.toRow) {
         const isKingside = move.toCol > move.fromCol;
         let san = isKingside ? 'O-O' : 'O-O-O';
@@ -376,40 +375,32 @@ function toSAN(boardState, move, player) {
         return san;
     }
     
-    // ---- Build piece prefix + destination ----
     const dest = squareName(move.toRow, move.toCol);
     let san = '';
     
     if (isPawn) {
-        // Pawn capture: file letter of departure + 'x' + destination
         if (targetPiece) {
             san += squareName(move.fromRow, move.fromCol)[0] + 'x' + dest;
         } else if (enPassantCapture(boardState, move, player)) {
-            // En passant is a capture even though destination square is empty
             san += squareName(move.fromRow, move.fromCol)[0] + 'x' + dest;
         } else {
             san += dest;
         }
         
-        // Promotion
         if (move.toRow === 0 || move.toRow === 7) {
-            // We don't know which piece; game always promotes to queen in makeMove
             san += '=Q';
         }
     } else {
-        // Non-pawn: piece letter, disambiguation, capture marker, destination
         const pieceLetter = SAN_PIECE_LETTER[piece] || '';
         san += pieceLetter;
         
-        // Disambiguation: find other same-type pieces that can also legally move to dest
         const samePieces = [];
         for (let r = 0; r < 8; r++) {
             for (let c = 0; c < 8; c++) {
                 if (r === move.fromRow && c === move.fromCol) continue;
                 const other = boardState[r][c];
                 if (!other) continue;
-                if (other !== piece) continue;  // same exact glyph
-                // Would this other piece be able to move to dest?
+                if (other !== piece) continue;
                 if (canPieceLegallyReach(boardState, r, c, move.toRow, move.toCol, player)) {
                     samePieces.push({ row: r, col: c });
                 }
@@ -420,11 +411,11 @@ function toSAN(boardState, move, player) {
             const sameFile = samePieces.some(p => p.col === move.fromCol);
             const sameRank = samePieces.some(p => p.row === move.fromRow);
             if (!sameFile) {
-                san += squareName(move.fromRow, move.fromCol)[0];  // file only
+                san += squareName(move.fromRow, move.fromCol)[0];
             } else if (!sameRank) {
-                san += squareName(move.fromRow, move.fromCol)[1];  // rank only
+                san += squareName(move.fromRow, move.fromCol)[1];
             } else {
-                san += squareName(move.fromRow, move.fromCol);     // full square
+                san += squareName(move.fromRow, move.fromCol);
             }
         }
         
@@ -432,7 +423,6 @@ function toSAN(boardState, move, player) {
         san += dest;
     }
     
-    // ---- Check / checkmate suffix ----
     san += getCheckSuffix(boardState, move, player);
     
     return san;
@@ -442,16 +432,11 @@ function enPassantCapture(boardState, move, player) {
     const piece = boardState[move.fromRow][move.fromCol];
     const pieceCode = pieceMap[piece] || '';
     if (pieceCode.toLowerCase() !== 'p') return false;
-    if (move.fromCol === move.toCol) return false;    // not a diagonal
-    if (boardState[move.toRow][move.toCol]) return false;  // destination occupied (normal capture)
-    // Diagonal pawn move to empty square = en passant
+    if (move.fromCol === move.toCol) return false;
+    if (boardState[move.toRow][move.toCol]) return false;
     return true;
 }
 
-/**
- * Check if a piece at (fromRow, fromCol) can legally reach (toRow, toCol)
- * on the given board. Used for SAN disambiguation. Does NOT consider castling.
- */
 function canPieceLegallyReach(boardState, fromRow, fromCol, toRow, toCol, player) {
     const piece = boardState[fromRow][fromCol];
     if (!piece) return false;
@@ -480,21 +465,15 @@ function canPieceLegallyReach(boardState, fromRow, fromCol, toRow, toCol, player
             return false;
     }
     
-    // Reject if the move would leave own king in check
     if (wouldKingBeInCheckAfter(boardState, fromRow, fromCol, toRow, toCol, player)) return false;
     return true;
 }
 
-/**
- * Append '+' if the move gives check, '#' if it gives checkmate.
- * Applies the move temporarily to test.
- */
 function getCheckSuffix(boardState, move, player) {
     const opponent = player === 'white' ? 'black' : 'white';
     const newBoard = makeTestMoveForPosition(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol);
     if (!newBoard) return '';
     if (!isKingInCheckForPosition(newBoard, opponent)) return '';
-    // Checkmate = opponent has no legal moves after this
     const opponentMoves = getAllPossibleMovesForPosition(newBoard, opponent);
     if (opponentMoves.length === 0) return '#';
     return '+';
@@ -1892,8 +1871,6 @@ function findBestMoveWithRiskAssessment() {
     
     for (const move of allMoves) {
         if (isEndgame) {
-            // Pre-filter moves that perpetuate endless checks. Use SAN for candidate to
-            // correctly detect '+'/'#' markers.
             const candidateSAN = toSAN(board, move, currentPlayer);
             const testHistory = [...moveHistory, candidateSAN];
             if (isEndlessCheck(testHistory, currentPlayer)) continue;
@@ -2227,7 +2204,6 @@ function makeMove(fromRow, fromCol, toRow, toCol) {
     
     lastMove = { fromRow, fromCol, toRow, toCol };
     
-    // Compute SAN BEFORE mutating the board (needs to inspect the current position).
     const sanMove = toSAN(board, { fromRow, fromCol, toRow, toCol }, currentPlayer);
     const coordinateMove = toAlgebraicMove(fromRow, fromCol, toRow, toCol);
     
@@ -2267,7 +2243,8 @@ function makeMove(fromRow, fromCol, toRow, toCol) {
     moveHistory.push(sanMove);
     updateMoveHistory();
     
-    pruneCachesToLine(moveHistory);
+    // Prune using coordinate-form active line, matching the cache's branch prefixes.
+    pruneCachesToLine(moveTree ? moveTree.activeLineMoves : moveHistory);
     
     createBoard();
     if (moveTree) moveTree.pruneInactiveLines(moveTree.activeLineMoves);
@@ -2542,7 +2519,8 @@ function undoMove() {
     gameOver = false;
     if (moveTree) moveTree.activeLineMoves.pop();
     
-    pruneCachesToLine(moveHistory);
+    // Prune using coordinate-form active line, matching the cache's branch prefixes.
+    pruneCachesToLine(moveTree ? moveTree.activeLineMoves : moveHistory);
     
     createBoard();
     updateStatus();
@@ -2595,4 +2573,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - SAN notation for display, aspiration at root`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - SAN notation, aspiration at root, coordinate-aligned cache pruning`);
