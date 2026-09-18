@@ -1605,41 +1605,9 @@ function computeMoveBudget(remainingMs, incrementMs) {
 }
 
 function checkTimeOut() {
-    if (searchAborted) return true;
+    // The bot ignores the clock; search only runs to fixed depth.
+    // Still count nodes for logging, but never abort based on the clock.
     nodesSearched++;
-    if ((nodesSearched & 0x3FF) === 0) {
-        // The event loop is blocked during search, so tickClock cannot fire.
-        // Update the active player's clock inline here instead.
-        if (!timeControl.unlimited && clockRunning && !gameOver) {
-            const now = performance.now();
-            const elapsed = now - turnStartTime;
-            turnStartTime = now;
-            
-            if (currentPlayer === 'white') {
-                whiteClockMs -= elapsed;
-                if (whiteClockMs <= 0) {
-                    whiteClockMs = 0;
-                    updateClockDisplay();
-                    searchAborted = true;
-                    return true;
-                }
-            } else {
-                blackClockMs -= elapsed;
-                if (blackClockMs <= 0) {
-                    blackClockMs = 0;
-                    updateClockDisplay();
-                    searchAborted = true;
-                    return true;
-                }
-            }
-            updateClockDisplay();
-        }
-        
-        if (performance.now() > searchDeadline) {
-            searchAborted = true;
-            return true;
-        }
-    }
     return false;
 }
 
@@ -1979,16 +1947,16 @@ function findBestMoveWithRiskAssessment(budgetMs) {
     
     const hasBudget = typeof budgetMs === 'number' && budgetMs > 0;
     searchStartTime = performance.now();
-    searchDeadline = hasBudget ? searchStartTime + budgetMs : Infinity;
+    searchDeadline = Infinity;
     searchAborted = false;
     nodesSearched = 0;
     
     const isEndgame = isEndgamePositionForPosition(board);
     const fixedDepth = isEndgame ? SEARCH_CONFIG.endgameDepth : SEARCH_CONFIG.baseDepth;
-    const startDepth = hasBudget ? 1 : fixedDepth;
-    const maxDepth = hasBudget ? TIME_CONTROL.hardMaxDepth : fixedDepth;
+    const startDepth = 1;
+    const maxDepth = fixedDepth;
     
-    console.log(`🔍 ${currentPlayer.toUpperCase()} AI searching ${hasBudget ? `(budget ${budgetMs.toFixed(0)}ms)` : `at depth ${fixedDepth}`}`);
+    console.log(`🔍 ${currentPlayer.toUpperCase()} AI searching at depth ${fixedDepth}${isEndgame ? ' (endgame)' : ''}`);
     
     allMoves.sort((a, b) => {
         const targetA = board[a.toRow][a.toCol];
@@ -2016,8 +1984,6 @@ function findBestMoveWithRiskAssessment(budgetMs) {
         if (!isKingMoveRoot) {
             const targetPiece = board[move.toRow][move.toCol];
             if (targetPiece) {
-                // Capture: use full SEE. Reject clearly losing exchanges,
-                // but give check-giving moves more leeway (they may be sacrifices).
                 const see = evaluateCaptureSafety(board, move.fromRow, move.fromCol, move.toRow, move.toCol, currentPlayer);
                 
                 let givesCheck = false;
@@ -2033,7 +1999,6 @@ function findBestMoveWithRiskAssessment(budgetMs) {
                     continue;
                 }
             } else {
-                // Quiet move: reject if the piece lands on an attacked, undefended square.
                 const hungValue = getHungPieceValue(board, move.fromRow, move.fromCol, move.toRow, move.toCol, currentPlayer);
                 if (hungValue > 200) {
                     console.log(`⏭️ Skipping ${toSAN(board, move, currentPlayer)} (hangs ${hungValue})`);
@@ -2055,13 +2020,9 @@ function findBestMoveWithRiskAssessment(budgetMs) {
     let finalResults = null;
     
     for (let depth = startDepth; depth <= maxDepth; depth++) {
-        if (searchAborted && depth > startDepth) break;
-        
         const { results, iterBestMove, iterBestEval, aborted } = searchAllRootMoves(
             candidateMoves, depth, opponentColor, opponentIsMaximizing
         );
-        
-        if (aborted && depth > startDepth) break;
         
         if (iterBestMove) {
             bestMove = iterBestMove;
@@ -2073,8 +2034,6 @@ function findBestMoveWithRiskAssessment(budgetMs) {
             candidateMoves.length = 0;
             for (const r of results) candidateMoves.push(r.move);
         }
-        
-        if (searchAborted) break;
     }
     
     if (finalResults && finalResults.length > 0) {
@@ -2102,12 +2061,8 @@ function findBestMoveWithRiskAssessment(budgetMs) {
 }
 
 function findBestMove() {
-    if (timeControl.unlimited) {
-        return findBestMoveWithRiskAssessment(null);
-    }
-    const myClock = currentPlayer === 'white' ? whiteClockMs : blackClockMs;
-    const budget = computeMoveBudget(myClock, timeControl.incrementMs);
-    return findBestMoveWithRiskAssessment(budget);
+    // Bot ignores the clock and always searches to fixed depth.
+    return findBestMoveWithRiskAssessment(null);
 }
 
 // ========== TIME CONTROL FUNCTIONS ==========
@@ -2159,22 +2114,6 @@ function startClock() {
 }
 
 function stopClock() {
-    // Account for time elapsed since the last tick before stopping.
-    // Critical when a synchronous operation (like the AI search) blocks
-    // the event loop and prevents tickClock from firing.
-    if (clockRunning && !timeControl.unlimited && !gameOver) {
-        const now = performance.now();
-        const elapsed = now - turnStartTime;
-        if (currentPlayer === 'white') {
-            whiteClockMs -= elapsed;
-            if (whiteClockMs < 0) whiteClockMs = 0;
-        } else {
-            blackClockMs -= elapsed;
-            if (blackClockMs < 0) blackClockMs = 0;
-        }
-        turnStartTime = now;
-    }
-    
     if (clockInterval) {
         clearInterval(clockInterval);
         clockInterval = null;
@@ -2185,6 +2124,9 @@ function stopClock() {
 
 function tickClock() {
     if (!clockRunning || gameOver || timeControl.unlimited) return;
+    
+    // The AI ignores the clock — skip ticking on its turn in AI mode.
+    if (gameMode === 'ai' && currentPlayer === aiPlayer) return;
     
     const now = performance.now();
     const elapsed = now - turnStartTime;
@@ -2265,15 +2207,6 @@ function changeTimeControl() {
 function afterMove() {
     const mover = currentPlayer;
     stopClock();
-    
-    // Check if the mover flagged — e.g. AI's search took longer than its remaining clock.
-    if (!timeControl.unlimited) {
-        const moverClock = mover === 'white' ? whiteClockMs : blackClockMs;
-        if (moverClock <= 0) {
-            handleFlagFall(mover);
-            return;
-        }
-    }
     
     applyIncrement(mover);
     switchPlayer();
@@ -2679,19 +2612,6 @@ function makeAIMove() {
     setTimeout(() => {
         const bestMove = findBestMove();
         
-        // Check if we flagged during the search — if so, don't play the move.
-        const myClock = currentPlayer === 'white' ? whiteClockMs : blackClockMs;
-        if (!timeControl.unlimited && myClock <= 0) {
-            isThinking = false;
-            if (thinkingElement) thinkingElement.style.display = 'none';
-            if (syncStatusElement) {
-                syncStatusElement.textContent = 'Ready';
-                syncStatusElement.classList.remove('thinking');
-            }
-            handleFlagFall(currentPlayer);
-            return;
-        }
-        
         if (bestMove && !gameOver) {
             makeMove(bestMove.fromRow, bestMove.fromCol, bestMove.toRow, bestMove.toCol);
             isThinking = false;
@@ -2912,4 +2832,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - SEE-based root filter, time controls, iterative deepening`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - bot plays at fixed depth, human clock still works`);
