@@ -2014,12 +2014,31 @@ function findBestMoveWithRiskAssessment(budgetMs) {
         const movingPieceRoot = board[move.fromRow][move.fromCol];
         const isKingMoveRoot = (movingPieceRoot === '♔' || movingPieceRoot === '♚');
         if (!isKingMoveRoot) {
-            const targetPieceForHungCheck = board[move.toRow][move.toCol];
-            const targetValueForHungCheck = targetPieceForHungCheck ? (PIECE_VALUES[targetPieceForHungCheck] || 0) : 0;
-            const hungValue = getHungPieceValue(board, move.fromRow, move.fromCol, move.toRow, move.toCol, currentPlayer);
-            if (hungValue > targetValueForHungCheck + 200) {
-                console.log(`⏭️ Skipping ${toSAN(board, move, currentPlayer)} (hangs ${hungValue})`);
-                continue;
+            const targetPiece = board[move.toRow][move.toCol];
+            if (targetPiece) {
+                // Capture: use full SEE. Reject clearly losing exchanges,
+                // but give check-giving moves more leeway (they may be sacrifices).
+                const see = evaluateCaptureSafety(board, move.fromRow, move.fromCol, move.toRow, move.toCol, currentPlayer);
+                
+                let givesCheck = false;
+                const nb = makeTestMoveForPosition(board, move.fromRow, move.fromCol, move.toRow, move.toCol);
+                if (nb) {
+                    const opp = currentPlayer === 'white' ? 'black' : 'white';
+                    givesCheck = isKingInCheckForPosition(nb, opp);
+                }
+                
+                const seeThreshold = givesCheck ? -300 : -100;
+                if (see < seeThreshold) {
+                    console.log(`⏭️ Skipping ${toSAN(board, move, currentPlayer)} (SEE ${see})`);
+                    continue;
+                }
+            } else {
+                // Quiet move: reject if the piece lands on an attacked, undefended square.
+                const hungValue = getHungPieceValue(board, move.fromRow, move.fromCol, move.toRow, move.toCol, currentPlayer);
+                if (hungValue > 200) {
+                    console.log(`⏭️ Skipping ${toSAN(board, move, currentPlayer)} (hangs ${hungValue})`);
+                    continue;
+                }
             }
         }
         
@@ -2893,4 +2912,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - time controls, iterative deepening, SAN notation`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - SEE-based root filter, time controls, iterative deepening`);
