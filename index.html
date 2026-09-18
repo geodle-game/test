@@ -61,7 +61,7 @@
             color: #333;
         }
 
-        .game-mode {
+        .game-mode, .time-control-row {
             text-align: center;
             margin: 15px 0;
             padding: 15px;
@@ -70,13 +70,13 @@
             box-shadow: 0 2px 8px rgba(0,0,0,0.1);
         }
 
-        .game-mode label {
+        .game-mode label, .time-control-row label {
             font-weight: bold;
             margin-right: 10px;
             color: #333;
         }
 
-        .game-mode select {
+        .game-mode select, .time-control-row select {
             padding: 8px 15px;
             font-size: 14px;
             border-radius: 8px;
@@ -88,15 +88,75 @@
             font-weight: bold;
         }
 
-        .game-mode select:hover {
+        .game-mode select:hover, .time-control-row select:hover {
             border-color: #5a6fd8;
             box-shadow: 0 2px 8px rgba(102, 126, 234, 0.3);
         }
 
-        .game-mode select:focus {
+        .game-mode select:focus, .time-control-row select:focus {
             outline: none;
             border-color: #4f5cd1;
             box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.2);
+        }
+
+        /* ========== CLOCK STYLES ========== */
+        .clocks {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            margin: 20px 0;
+        }
+
+        .clock-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 6px 10px;
+            gap: 15px;
+        }
+
+        .clock-label {
+            font-weight: bold;
+            font-size: 15px;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+            color: #333;
+            min-width: 60px;
+        }
+
+        .clock {
+            font-family: 'Courier New', monospace;
+            font-size: 26px;
+            font-weight: bold;
+            letter-spacing: 2px;
+            padding: 10px 20px;
+            background: linear-gradient(135deg, #f5f5f5 0%, #e8e8e8 100%);
+            border-radius: 10px;
+            border: 2px solid #ddd;
+            transition: all 0.3s ease;
+            min-width: 120px;
+            text-align: center;
+            color: #333;
+        }
+
+        .clock.active {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-color: #4a5bb8;
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+            transform: scale(1.02);
+        }
+
+        .clock.low {
+            background: linear-gradient(135deg, #ff6b6b 0%, #ee5a24 100%) !important;
+            color: white !important;
+            border-color: #c0392b !important;
+            animation: lowPulse 1s infinite;
+        }
+
+        @keyframes lowPulse {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(255, 68, 68, 0.7); }
+            50% { box-shadow: 0 0 0 10px rgba(255, 68, 68, 0); }
         }
 
         #chessboard {
@@ -276,11 +336,6 @@
             background: linear-gradient(135deg, #ccc 0%, #999 100%);
             cursor: not-allowed;
             transform: none;
-        }
-
-        button:disabled:hover {
-            transform: none;
-            box-shadow: 0 6px 12px rgba(0,0,0,0.2);
         }
 
         .status {
@@ -481,6 +536,12 @@
                 padding: 12px 20px;
                 font-size: 14px;
             }
+
+            .clock {
+                font-size: 22px;
+                min-width: 100px;
+                padding: 8px 14px;
+            }
         }
 
         @media (max-width: 480px) {
@@ -541,6 +602,34 @@
                 <option value="player">Player vs Player</option>
             </select>
         </div>
+
+        <div class="time-control-row">
+            <label for="timeControl">Time Control:</label>
+            <select id="timeControl" onchange="changeTimeControl()">
+                <option value="unlimited" selected>Unlimited</option>
+                <option value="1+0">Bullet 1+0</option>
+                <option value="2+1">Bullet 2+1</option>
+                <option value="3+0">Blitz 3+0</option>
+                <option value="3+2">Blitz 3+2</option>
+                <option value="5+0">Blitz 5+0</option>
+                <option value="5+3">Blitz 5+3</option>
+                <option value="10+0">Rapid 10+0</option>
+                <option value="10+5">Rapid 10+5</option>
+                <option value="15+10">Rapid 15+10</option>
+                <option value="30+0">Classical 30+0</option>
+            </select>
+        </div>
+
+        <div class="clocks">
+            <div class="clock-row">
+                <div class="clock-label">Black</div>
+                <div class="clock" id="black-clock">∞</div>
+            </div>
+            <div class="clock-row">
+                <div class="clock-label">White</div>
+                <div class="clock" id="white-clock">∞</div>
+            </div>
+        </div>
         
         <div class="sync-status" id="sync-status">Ready</div>
         
@@ -566,6 +655,9 @@
             <strong>🧠 Smart AI Features:</strong> 
             This AI uses a professional opening book, learns from games, and adapts its difficulty. 
             It employs advanced evaluation including piece positioning, king safety, mobility, and tactical awareness.
+            <br><br>
+            <strong>⏱️ Time Controls:</strong> Select a preset above. The AI allocates its time budget automatically —
+            it uses more time in complex positions and less in obvious ones. Bullet games typically use ~100ms–500ms per move.
         </div>
     </div>
 
@@ -577,8 +669,6 @@
 
     <script>
         // ========== PAWN IMAGE SWAP ==========
-        // After the board is rendered by createBoard(), replace the pawn glyphs
-        // with images from assets/. White pawn = ♙, Black pawn = ♟.
         const PAWN_IMAGES = {
             '♙': 'assets/white_pawn.png',
             '♟': 'assets/black_pawn.png'
@@ -599,8 +689,6 @@
             });
         }
 
-        // Wrap createBoard so every redraw gets images applied automatically.
-        // We poll for the function to exist, then replace it.
         const _pawnSwapInterval = setInterval(() => {
             if (typeof window.createBoard === 'function') {
                 const originalCreateBoard = window.createBoard;
@@ -609,7 +697,6 @@
                     applyPawnImages();
                 };
                 clearInterval(_pawnSwapInterval);
-                // In case a board is already on screen from the initial load
                 applyPawnImages();
             }
         }, 50);
