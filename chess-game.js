@@ -2113,11 +2113,28 @@ function startClock() {
 }
 
 function stopClock() {
+    // Account for time elapsed since the last tick before stopping.
+    // Critical when a synchronous operation (like the AI search) blocks
+    // the event loop and prevents tickClock from firing.
+    if (clockRunning && !timeControl.unlimited && !gameOver) {
+        const now = performance.now();
+        const elapsed = now - turnStartTime;
+        if (currentPlayer === 'white') {
+            whiteClockMs -= elapsed;
+            if (whiteClockMs < 0) whiteClockMs = 0;
+        } else {
+            blackClockMs -= elapsed;
+            if (blackClockMs < 0) blackClockMs = 0;
+        }
+        turnStartTime = now;
+    }
+    
     if (clockInterval) {
         clearInterval(clockInterval);
         clockInterval = null;
     }
     clockRunning = false;
+    updateClockDisplay();
 }
 
 function tickClock() {
@@ -2202,6 +2219,16 @@ function changeTimeControl() {
 function afterMove() {
     const mover = currentPlayer;
     stopClock();
+    
+    // Check if the mover flagged — e.g. AI's search took longer than its remaining clock.
+    if (!timeControl.unlimited) {
+        const moverClock = mover === 'white' ? whiteClockMs : blackClockMs;
+        if (moverClock <= 0) {
+            handleFlagFall(mover);
+            return;
+        }
+    }
+    
     applyIncrement(mover);
     switchPlayer();
     updateStatus();
