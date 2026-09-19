@@ -1580,6 +1580,11 @@ const ASPIRATION = {
     maxDelta: 2000
 };
 
+// Maximum check extensions per search path. Without this cap, a perpetual
+// check sequence recurses forever because every ply at depth 0 with inCheck
+// resets depth to 1, adding a new stack frame each time.
+const MAX_CHECK_EXTENSIONS = 4;
+
 // ========== TIME MANAGEMENT ==========
 const TIME_CONTROL = {
     movesToGo: 30,
@@ -1594,6 +1599,12 @@ let searchStartTime = 0;
 let searchDeadline = 0;
 let searchAborted = false;
 let nodesSearched = 0;
+
+// ========== REPETITION DETECTION ==========
+let searchLinePositions = [];       // position keys on the current search path (+ game history)
+let avoidRepetition = false;        // true when the side-to-move at root is clearly winning
+let rootEvalWhite = 0;              // root eval, from White's perspective (for penalty direction)
+const REPETITION_PENALTY = 30;      // small nudge away from draws when winning; 0 = pure draw scoring
 
 function computeMoveBudget(remainingMs, incrementMs) {
     if (remainingMs <= 0) return TIME_CONTROL.minBudgetMs;
@@ -1665,7 +1676,38 @@ function quiescenceSearch(boardState, alpha, beta, player, qDepth) {
     return alpha;
 }
 
-function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, player, moveNumber) {
+/**
+ * Wrapper that detects threefold-like repetition before delegating to the
+ * inner minimax. Returns 0 for a repeated position (a draw), optionally
+ * nudged by REPETITION_PENALTY when the side-to-move at root is winning.
+ *
+ * Emergent behavior:
+ *   - Winning → continuations beat the draw, so repetitions are avoided.
+ *   - Losing  → the draw beats worse continuations, so repetitions are taken.
+ *
+ * checkExtCount is threaded through the wrapper so the inner can cap how many
+ * times it extends the search on a check (see MAX_CHECK_EXTENSIONS).
+ */
+function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, player, moveNumber, checkExtCount = 0) {
+    if (checkTimeOut()) return 0;
+    if (!boardState) return 0;
+    
+    const posKey = boardToHash(boardState) + "|" + player;
+    if (searchLinePositions.includes(posKey)) {
+        if (avoidRepetition) {
+            // Nudge away from the draw: return a bad score for whichever side is winning.
+            return rootEvalWhite > 0 ? -REPETITION_PENALTY : REPETITION_PENALTY;
+        }
+        return 0;
+    }
+    
+    searchLinePositions.push(posKey);
+    const result = minimaxWithRiskInner(boardState, depth, alpha, beta, isMaximizingPlayer, player, moveNumber, checkExtCount);
+    searchLinePositions.pop();
+    return result;
+}
+
+function minimaxWithRiskInner(boardState, depth, alpha, beta, isMaximizingPlayer, player, moveNumber, checkExtCount) {
     if (checkTimeOut()) return 0;
     if (!boardState) return 0;
     
@@ -1695,7 +1737,15 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
         }
     }
     
-    if (depth <= 0) depth = 1;
+    if (depth <= 0) {
+        if (inCheck && checkExtCount < MAX_CHECK_EXTENSIONS) {
+            depth = 1;
+            checkExtCount++;
+        } else {
+            // Hit the extension cap — fall through to quiescence to stop the recursion.
+            return quiescenceSearch(boardState, alpha, beta, player, SEARCH_CONFIG.quiescenceDepth);
+        }
+    }
     
     moves.sort((a, b) => {
         return scoreMoveForOrdering(boardState, b, player, depth) - scoreMoveForOrdering(boardState, a, player, depth);
@@ -1736,7 +1786,7 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
             const moveStr = toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol);
             const savedBranch = pushBranch(moveStr);
             const newBoard = makeTestMoveForPosition(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol);
-            let evalValue = minimaxWithRisk(newBoard, depth - 1, alpha, beta, false, nextPlayer, moveNumber + 1);
+            let evalValue = minimaxWithRisk(newBoard, depth - 1, alpha, beta, false, nextPlayer, moveNumber + 1, checkExtCount);
             restoreBranch(savedBranch);
             
             if (targetPiece && !isKingMove) {
@@ -1784,7 +1834,7 @@ function minimaxWithRisk(boardState, depth, alpha, beta, isMaximizingPlayer, pla
             const moveStr = toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol);
             const savedBranch = pushBranch(moveStr);
             const newBoard = makeTestMoveForPosition(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol);
-            let evalValue = minimaxWithRisk(newBoard, depth - 1, alpha, beta, true, nextPlayer, moveNumber + 1);
+            let evalValue = minimaxWithRisk(newBoard, depth - 1, alpha, beta, true, nextPlayer, moveNumber + 1, checkExtCount);
             restoreBranch(savedBranch);
             
             if (targetPiece && !isKingMove) {
@@ -1814,7 +1864,7 @@ function searchRootMoveWithAspiration(newBoard, depth, center, opponentIsMaximiz
     while (delta <= ASPIRATION.maxDelta) {
         const alpha = center - delta;
         const beta = center + delta;
-        const score = minimaxWithRisk(newBoard, depth, alpha, beta, opponentIsMaximizing, opponentColor, moveCount);
+        const score = minimaxWithRisk(newBoard, depth, alpha, beta, opponentIsMaximizing, opponentColor, moveCount, 0);
         
         if (score <= alpha) {
             return { score, boundType: 'upper' };
@@ -1825,7 +1875,7 @@ function searchRootMoveWithAspiration(newBoard, depth, center, opponentIsMaximiz
         return { score, boundType: 'exact' };
     }
     
-    const score = minimaxWithRisk(newBoard, depth, -Infinity, Infinity, opponentIsMaximizing, opponentColor, moveCount);
+    const score = minimaxWithRisk(newBoard, depth, -Infinity, Infinity, opponentIsMaximizing, opponentColor, moveCount, 0);
     return { score, boundType: 'exact' };
 }
 
@@ -1880,7 +1930,7 @@ function searchAllRootMoves(candidateMoves, depth, opponentColor, opponentIsMaxi
         let score;
         if (!searchCenter.haveBaseline) {
             score = minimaxWithRisk(newBoard, depth - 1, -Infinity, Infinity, opponentIsMaximizing,
-                opponentColor, moveCount + 1);
+                opponentColor, moveCount + 1, 0);
             searchCenter.value = score;
             searchCenter.haveBaseline = true;
         } else {
@@ -1917,11 +1967,25 @@ function findBestMoveWithRiskAssessment(budgetMs) {
     setSearchPrefix(moveHistory.join("|"));
     resetSearchHeuristics();
     
+    // Repetition setup: seed search-line with every position the game has passed through.
+    rootEvalWhite = evaluatePositionForSearch(board, currentPlayer, moveCount);
+    avoidRepetition = Math.abs(rootEvalWhite) > 150;   // ~1.5 pawns either way
+    searchLinePositions = [];
+    for (const state of gameHistory) {
+        searchLinePositions.push(boardToHash(state.board) + "|" + state.currentPlayer);
+    }
+    searchLinePositions.push(boardToHash(board) + "|" + currentPlayer);
+    
     const allMoves = getAllPossibleMoves(currentPlayer);
     if (allMoves.length === 0) return null;
     
     const opponentColor = currentPlayer === 'white' ? 'black' : 'white';
     const opponentIsMaximizing = (opponentColor === 'white');
+    
+    // If we're in check, we must find a legal response — the material filters below
+    // would reject legitimate check evasions (e.g., a knight recapture that loses a
+    // pawn on SEE but resolves the check), so we skip them entirely.
+    const aiInCheck = isKingInCheckForPosition(board, currentPlayer);
     
     for (const move of allMoves) {
         const newBoard = makeTestMoveForPosition(board, move.fromRow, move.fromCol, move.toRow, move.toCol);
@@ -1956,7 +2020,7 @@ function findBestMoveWithRiskAssessment(budgetMs) {
     const startDepth = 1;
     const maxDepth = fixedDepth;
     
-    console.log(`🔍 ${currentPlayer.toUpperCase()} AI searching at depth ${fixedDepth}${isEndgame ? ' (endgame)' : ''}`);
+    console.log(`🔍 ${currentPlayer.toUpperCase()} AI searching at depth ${fixedDepth}${isEndgame ? ' (endgame)' : ''}${avoidRepetition ? ' [avoiding draws]' : ''}${aiInCheck ? ' [in check]' : ''}`);
     
     allMoves.sort((a, b) => {
         const targetA = board[a.toRow][a.toCol];
@@ -1981,7 +2045,9 @@ function findBestMoveWithRiskAssessment(budgetMs) {
         
         const movingPieceRoot = board[move.fromRow][move.fromCol];
         const isKingMoveRoot = (movingPieceRoot === '♔' || movingPieceRoot === '♚');
-        if (!isKingMoveRoot) {
+        
+        // Skip material filters when in check — any legal response is a valid candidate.
+        if (!isKingMoveRoot && !aiInCheck) {
             const targetPiece = board[move.toRow][move.toCol];
             if (targetPiece) {
                 const see = evaluateCaptureSafety(board, move.fromRow, move.fromCol, move.toRow, move.toCol, currentPlayer);
@@ -2832,4 +2898,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - bot plays at fixed depth, human clock still works`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - capped check extensions, in-check root filter bypass`);
