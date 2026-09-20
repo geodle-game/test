@@ -1982,6 +1982,9 @@ function searchAllRootMoves(candidateMoves, depth, opponentColor, opponentIsMaxi
             iterBestMove = move;
             iterBestEval = adjusted;
         }
+        
+        // TEMP DEBUG: log every root candidate and its eval.
+        console.log(`   root: ${toSAN(board, move, currentPlayer)} = ${adjusted.toFixed(1)}`);
     }
     
     return { results, iterBestMove, iterBestEval, aborted };
@@ -2922,4 +2925,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - qsearch fixed to White-perspective, capped check extensions, in-check root filter bypass`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - TEMP DEBUG logging every root move`);
