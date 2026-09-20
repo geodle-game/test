@@ -1624,22 +1624,36 @@ function checkTimeOut() {
 
 let transpositionTable = new Map();
 
+/**
+ * Quiescence search. All scores (standPat, children) are from White's perspective,
+ * matching minimaxWithRisk's convention: positive = good for White, negative = good
+ * for Black. Max updates are used at White-to-move nodes, min updates at Black-to-move
+ * nodes. This is NOT negamax — do not negate child scores.
+ */
 function quiescenceSearch(boardState, alpha, beta, player, qDepth) {
     if (checkTimeOut()) return 0;
     
     const moves = getAllPossibleMovesForPosition(boardState, player);
     if (moves.length === 0) {
         if (isKingInCheckForPosition(boardState, player)) {
-            return -20000;
+            // Mate score, from White's perspective.
+            return player === 'white' ? -20000 : 20000;
         }
         return 0;
     }
     
     if (qDepth <= 0) return evaluatePositionForSearch(boardState, player, moveCount);
     
-    let standPat = evaluatePositionForSearch(boardState, player, moveCount);
-    if (standPat >= beta) return beta;
-    if (alpha < standPat) alpha = standPat;
+    // standPat is from White's perspective.
+    const standPat = evaluatePositionForSearch(boardState, player, moveCount);
+    
+    if (player === 'white') {
+        if (standPat >= beta) return beta;
+        if (alpha < standPat) alpha = standPat;
+    } else {
+        if (standPat <= alpha) return alpha;
+        if (beta > standPat) beta = standPat;
+    }
     
     const inCheck = isKingInCheckForPosition(boardState, player);
     const candidateMoves = inCheck
@@ -1657,7 +1671,7 @@ function quiescenceSearch(boardState, alpha, beta, player, qDepth) {
     const opponent = player === 'white' ? 'black' : 'white';
     
     for (const move of candidateMoves) {
-        if (searchAborted) return alpha;
+        if (searchAborted) return player === 'white' ? alpha : beta;
         
         const movingPiece = boardState[move.fromRow][move.fromCol];
         const isKingMove = (movingPiece === '♔' || movingPiece === '♚');
@@ -1665,15 +1679,25 @@ function quiescenceSearch(boardState, alpha, beta, player, qDepth) {
             const seeScore = evaluateCaptureSafety(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol, player);
             if (seeScore < 0) continue;
         }
+        
         const moveStr = toAlgebraicMove(move.fromRow, move.fromCol, move.toRow, move.toCol);
         const savedBranch = pushBranch(moveStr);
         const newBoard = makeTestMoveForPosition(boardState, move.fromRow, move.fromCol, move.toRow, move.toCol);
-        const score = -quiescenceSearch(newBoard, -beta, -alpha, opponent, qDepth - 1);
+        
+        // Child score is already from White's perspective — do NOT negate.
+        const childScore = quiescenceSearch(newBoard, alpha, beta, opponent, qDepth - 1);
         restoreBranch(savedBranch);
-        if (score >= beta) return beta;
-        if (score > alpha) alpha = score;
+        
+        if (player === 'white') {
+            if (childScore > alpha) alpha = childScore;
+            if (alpha >= beta) return beta;
+        } else {
+            if (childScore < beta) beta = childScore;
+            if (beta <= alpha) return alpha;
+        }
     }
-    return alpha;
+    
+    return player === 'white' ? alpha : beta;
 }
 
 /**
@@ -2898,4 +2922,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - capped check extensions, in-check root filter bypass`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - qsearch fixed to White-perspective, capped check extensions, in-check root filter bypass`);
