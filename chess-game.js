@@ -1883,22 +1883,11 @@ function minimaxWithRiskInner(boardState, depth, alpha, beta, isMaximizingPlayer
 // ========== ASPIRATION SEARCH AT ROOT ==========
 
 function searchRootMoveWithAspiration(newBoard, depth, center, opponentIsMaximizing, opponentColor, moveCount) {
-    let delta = ASPIRATION.initialDelta;
-    
-    while (delta <= ASPIRATION.maxDelta) {
-        const alpha = center - delta;
-        const beta = center + delta;
-        const score = minimaxWithRisk(newBoard, depth, alpha, beta, opponentIsMaximizing, opponentColor, moveCount, 0);
-        
-        if (score <= alpha) {
-            return { score, boundType: 'upper' };
-        }
-        if (score >= beta) {
-            return { score, boundType: 'lower' };
-        }
-        return { score, boundType: 'exact' };
-    }
-    
+    // Aspiration windows disabled. The previous implementation returned alpha-beta
+    // bounds (fail-low/fail-high scores) as if they were exact evaluations, which
+    // corrupted move selection: any root move whose true score fell outside the
+    // narrow window around the previous move's score got a bound that was far off
+    // from its real value. Use a full window for every root move instead.
     const score = minimaxWithRisk(newBoard, depth, -Infinity, Infinity, opponentIsMaximizing, opponentColor, moveCount, 0);
     return { score, boundType: 'exact' };
 }
@@ -1942,7 +1931,6 @@ function searchAllRootMoves(candidateMoves, depth, opponentColor, opponentIsMaxi
     let iterBestMove = null;
     let iterBestEval = currentPlayer === 'white' ? -Infinity : Infinity;
     let aborted = false;
-    const searchCenter = { value: 0, haveBaseline: false };
     
     for (const move of candidateMoves) {
         if (searchAborted) { aborted = true; break; }
@@ -1951,17 +1939,9 @@ function searchAllRootMoves(candidateMoves, depth, opponentColor, opponentIsMaxi
         const savedBranch = pushBranch(moveStr);
         const newBoard = makeTestMoveForPosition(board, move.fromRow, move.fromCol, move.toRow, move.toCol);
         
-        let score;
-        if (!searchCenter.haveBaseline) {
-            score = minimaxWithRisk(newBoard, depth - 1, -Infinity, Infinity, opponentIsMaximizing,
-                opponentColor, moveCount + 1, 0);
-            searchCenter.value = score;
-            searchCenter.haveBaseline = true;
-        } else {
-            const asp = searchRootMoveWithAspiration(newBoard, depth - 1, searchCenter.value,
-                opponentIsMaximizing, opponentColor, moveCount + 1);
-            score = asp.score;
-        }
+        // Full-window search for every root move — no aspiration.
+        let score = minimaxWithRisk(newBoard, depth - 1, -Infinity, Infinity, opponentIsMaximizing,
+            opponentColor, moveCount + 1, 0);
         restoreBranch(savedBranch);
         
         if (searchAborted) { aborted = true; break; }
@@ -2925,4 +2905,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - TEMP DEBUG logging every root move`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - aspiration disabled at root, full-window per root move`);
