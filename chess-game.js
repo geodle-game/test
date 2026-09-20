@@ -1,8 +1,8 @@
 // chess-game.js
-// VERSION: 2.6.0 - Int8Array board, make/unmake, fast attack detection, PVS + null move
+// VERSION: 2.6.1 - Bug fixes for interior SEE filter, non-finite scores, mate ply scoring
 // COMPATIBLE WITH: chess-ai-database.js (v2.0), index.html, chess-game-database.js (v1.1)
 
-const GAME_VERSION = "2.6.0";
+const GAME_VERSION = "2.6.1";
 
 // ============================================================
 // PIECE CODES
@@ -588,10 +588,6 @@ function cacheSet(cache, key, value) {
     cache.set(key, { value });
 }
 
-// Piece-square-ish values computed dynamically, no tables.
-function getPieceValue(p) { return PIECE_VALUE_ARR[p]; }
-
-// Mobility per piece (rough count of moves)
 function pieceMobility(b, sq, player) {
     const piece = b[sq];
     if (piece === 0) return 0;
@@ -645,40 +641,30 @@ function evaluatePositionForSearch(b, player, moveNumber) {
     if (cached !== undefined) return cached;
 
     let score = 0;
-    let whiteMaterial = 0, blackMaterial = 0;
     let pieceCount = 0;
 
     for (let sq = 0; sq < 64; sq++) {
         const p = b[sq];
         if (p === 0) continue;
         const v = PIECE_VALUE_ARR[p];
-        if (isWhitePiece(p)) {
-            score += v;
-            whiteMaterial += v;
-        } else {
-            score -= v;
-            blackMaterial += v;
-        }
+        if (isWhitePiece(p)) score += v;
+        else score -= v;
         if (pieceType(p) !== 6) pieceCount++;
 
-        // Mobility
         const mob = pieceMobility(b, sq, isWhitePiece(p) ? 'white' : 'black');
         const weight = pieceType(p) === 2 ? 8 : pieceType(p) === 3 ? 6 : pieceType(p) === 4 ? 4 : pieceType(p) === 5 ? 3 : 1;
         score += (isWhitePiece(p) ? 1 : -1) * mob * weight * 0.5;
 
-        // Center bonus
         const r = sq >> 3, c = sq & 7;
         const centerDist = Math.abs(r - 3.5) + Math.abs(c - 3.5);
         const centerBonus = Math.max(0, 7 - centerDist * 1.5);
         score += (isWhitePiece(p) ? 1 : -1) * centerBonus * 0.5;
     }
 
-    // Attack detection per king
     const wKing = kingSq.white, bKing = kingSq.black;
     let wKingDanger = 0, bKingDanger = 0;
     let wKingEscapes = 0, bKingEscapes = 0;
 
-    // Count attackers near each king (crude)
     for (let sq = 0; sq < 64; sq++) {
         const p = b[sq];
         if (p === 0) continue;
@@ -691,7 +677,6 @@ function evaluatePositionForSearch(b, player, moveNumber) {
         }
     }
 
-    // King escape squares (rough)
     if (isSquareAttackedBy(b, wKing, 'black')) wKingDanger += 200;
     if (isSquareAttackedBy(b, bKing, 'white')) bKingDanger += 200;
     for (let i = 0; i < KING_DEGREE[wKing]; i++) {
@@ -712,7 +697,6 @@ function evaluatePositionForSearch(b, player, moveNumber) {
     score -= wKingDanger * 0.5;
     score += bKingDanger * 0.5;
 
-    // Pawn advancement
     for (let sq = 0; sq < 64; sq++) {
         const p = b[sq];
         if (p === WP) {
@@ -730,7 +714,6 @@ function evaluatePositionForSearch(b, player, moveNumber) {
         }
     }
 
-    // Endgame: encourage king activity
     if (pieceCount <= 10) {
         score += ((7 - (wKing >> 3)) + (wKing & 7)) * 3;
         score -= ((bKing >> 3) + (7 - (bKing & 7))) * 3;
@@ -749,67 +732,23 @@ function isEndgamePositionForPosition(b) {
     return count <= 10;
 }
 
-// ============================================================
-// SEE (Static Exchange Evaluation) — simplified
-// ============================================================
-function attackersTo(b, sq, color) {
-    const list = [];
-    const r = sq >> 3, c = sq & 7;
-
-    // Pawns
-    if (color === 'white') {
-        if (r < 7) {
-            if (c > 0 && b[sqFromRC(r+1, c-1)] === WP) list.push(sqFromRC(r+1, c-1));
-            if (c < 7 && b[sqFromRC(r+1, c+1)] === WP) list.push(sqFromRC(r+1, c+1));
-        }
-    } else {
-        if (r > 0) {
-            if (c > 0 && b[sqFromRC(r-1, c-1)] === BP) list.push(sqFromRC(r-1, c-1));
-            if (c < 7 && b[sqFromRC(r-1, c+1)] === BP) list.push(sqFromRC(r-1, c+1));
-        }
+// Returns true if the given player still has at least one non-pawn, non-king piece.
+// Used to skip null-move pruning in pawn-only endgames where zugzwang is common.
+function hasNonPawnMaterial(b, player) {
+    const isWhite = player === 'white';
+    for (let sq = 0; sq < 64; sq++) {
+        const p = b[sq];
+        if (p === 0) continue;
+        if (isWhitePiece(p) !== isWhite) continue;
+        const t = pieceType(p);
+        if (t !== 1 && t !== 6) return true;
     }
-
-    // Knights
-    const kn = color === 'white' ? WN : BN;
-    for (let i = 0; i < KNIGHT_DEGREE[sq]; i++) {
-        const t = KNIGHT_ATTACKS[sq * 8 + i];
-        if (b[t] === kn) list.push(t);
-    }
-    // King
-    const kg = color === 'white' ? WK : BK;
-    for (let i = 0; i < KING_DEGREE[sq]; i++) {
-        const t = KING_ATTACKS[sq * 8 + i];
-        if (b[t] === kg) list.push(t);
-    }
-    // Sliding
-    const eR = color === 'white' ? WR : BR;
-    const eB = color === 'white' ? WB : BB;
-    const eQ = color === 'white' ? WQ : BQ;
-    for (const [dr, dc] of [[-1,0],[1,0],[0,-1],[0,1]]) {
-        let nr = r + dr, nc = c + dc;
-        while (nr >= 0 && nr < 8 && nc >= 0 && nc < 8) {
-            const p = b[sqFromRC(nr, nc)];
-            if (p !== 0) {
-                if (p === eR || p === eQ) list.push(sqFromRC(nr, nc));
-                break;
-            }
-            nr += dr; nc += dc;
-        }
-    }
-    for (const [dr, dc] of [[-1,-1],[-1,1],[1,-1],[1,1]]) {
-        let nr = r + dr, nc = c + dc;
-        while (nr >= 0 && nr < 8 && nc >= 0 && nc < 8) {
-            const p = b[sqFromRC(nr, nc)];
-            if (p !== 0) {
-                if (p === eB || p === eQ) list.push(sqFromRC(nr, nc));
-                break;
-            }
-            nr += dr; nc += dc;
-        }
-    }
-    return list;
+    return false;
 }
 
+// ============================================================
+// SEE (Static Exchange Evaluation)
+// ============================================================
 function evaluateCaptureSafety(b, from, to, player) {
     const victim = b[to];
     if (victim === 0) return 0;
@@ -818,28 +757,6 @@ function evaluateCaptureSafety(b, from, to, player) {
     const attackerValue = PIECE_VALUE_ARR[attacker];
     // Simplified: if victim is worth more than attacker, good trade
     return victimValue - attackerValue;
-}
-
-function getHungPieceValue(b, from, to, player) {
-    const piece = b[from];
-    if (piece === 0) return 0;
-    const value = PIECE_VALUE_ARR[piece];
-    if (value < 300) return 0;
-
-    // Simulate the move
-    const savedEp = enPassantTarget;
-    makeMoveOnBoard(b, { from, to, promo: 0 });
-    const enemy = enemyColor(player);
-    const attacked = isSquareAttackedBy(b, to, enemy);
-    let defended = false;
-    if (attacked) {
-        // Is the piece defended by another of our pieces?
-        defended = isSquareAttackedBy(b, to, player);
-    }
-    unmakeMoveOnBoard(b, { from, to, promo: 0 });
-
-    if (attacked && !defended) return value;
-    return 0;
 }
 
 // ============================================================
@@ -877,6 +794,8 @@ function quiescenceSearch(b, alpha, beta, player, qDepth) {
     if (checkTimeOut()) return 0;
 
     const standPat = evaluatePositionForSearch(b, player, moveCount);
+    if (!isFinite(standPat)) return 0;
+
     if (player === 'white') {
         if (standPat >= beta) return beta;
         if (alpha < standPat) alpha = standPat;
@@ -885,7 +804,10 @@ function quiescenceSearch(b, alpha, beta, player, qDepth) {
         if (beta > standPat) beta = standPat;
     }
 
-    if (qDepth <= 0) return player === 'white' ? alpha : beta;
+    if (qDepth <= 0) {
+        const result = player === 'white' ? alpha : beta;
+        return isFinite(result) ? result : 0;
+    }
 
     const moves = getAllPossibleMovesForPosition(b, player);
     if (moves.length === 0) {
@@ -895,11 +817,10 @@ function quiescenceSearch(b, alpha, beta, player, qDepth) {
         return 0;
     }
 
-    // Only captures (and checks) in quiescence
     const inCheck = isSquareAttackedBy(b, kingSq[player], enemyColor(player));
     const candidates = inCheck ? moves : moves.filter(m => b[m.to] !== 0);
 
-    // Order by MVV-LVA
+    // MVV-LVA ordering
     candidates.sort((a, b1) => {
         const va = PIECE_VALUE_ARR[b[a.to]] - PIECE_VALUE_ARR[b[a.from]] / 10;
         const vb = PIECE_VALUE_ARR[b[b1.to]] - PIECE_VALUE_ARR[b[b1.from]] / 10;
@@ -908,7 +829,10 @@ function quiescenceSearch(b, alpha, beta, player, qDepth) {
 
     const enemy = enemyColor(player);
     for (const move of candidates) {
-        if (searchAborted) return player === 'white' ? alpha : beta;
+        if (searchAborted) {
+            const result = player === 'white' ? alpha : beta;
+            return isFinite(result) ? result : 0;
+        }
         makeMoveOnBoard(b, move);
         if (isSquareAttackedBy(b, kingSq[player], enemy)) {
             unmakeMoveOnBoard(b, move);
@@ -924,7 +848,8 @@ function quiescenceSearch(b, alpha, beta, player, qDepth) {
             if (beta <= alpha) return alpha;
         }
     }
-    return player === 'white' ? alpha : beta;
+    const result = player === 'white' ? alpha : beta;
+    return isFinite(result) ? result : 0;
 }
 
 function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
@@ -944,7 +869,10 @@ function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
     if (moves.length === 0) {
         searchLinePositions.pop();
         if (inCheck) {
-            return player === 'white' ? (-20000 - depth) : (20000 + depth);
+            // Shorter mates score higher. From White's perspective:
+            // White mated at ply N → -20000 + N (less bad the further away)
+            // Black mated at ply N → +20000 - N (less good the further away)
+            return player === 'white' ? (-20000 + ply) : (20000 - ply);
         }
         return 0;
     }
@@ -964,11 +892,11 @@ function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
         }
     }
 
-    // Null move pruning (skip when in check, low depth, or endgame)
-    if (allowNull && !inCheck && depth >= 3 && !isEndgamePositionForPosition(b)) {
-        // Make a null move: just flip side to move, keep ep = null
+    // Null move pruning: skip when in check, low depth, or when the moving side has
+    // no non-pawn, non-king pieces (zugzwang-prone).
+    const hasPieces = hasNonPawnMaterial(b, player);
+    if (allowNull && !inCheck && depth >= 3 && hasPieces && !isEndgamePositionForPosition(b)) {
         const savedEp = enPassantTarget;
-        const savedPlayer = currentPlayer;
         enPassantTarget = null;
         const R = 2;
         const nullScore = minimax(b, depth - 1 - R, alpha, beta, enemy, ply + 1, checkExt, false);
@@ -977,7 +905,7 @@ function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
         if (player === 'black' && nullScore <= alpha) { searchLinePositions.pop(); return alpha; }
     }
 
-    // Order moves
+    // Order moves by capture value
     moves.sort((a, b1) => {
         const va = PIECE_VALUE_ARR[b[a.to]] || 0;
         const vb = PIECE_VALUE_ARR[b[b1.to]] || 0;
@@ -985,25 +913,26 @@ function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
     });
 
     const isMax = (player === 'white');
-    let best = isMax ? -Infinity : Infinity;
+    const standPat = evaluatePositionForSearch(b, player, moveCount);
+    let best = isFinite(standPat) ? standPat : 0;
+    let anyMoveSearched = false;
 
     for (let i = 0; i < moves.length; i++) {
         if (searchAborted) break;
         const move = moves[i];
 
-        // Skip bad captures unless it's a check
-        if (b[move.to] !== 0 && !inCheck) {
-            const see = evaluateCaptureSafety(b, move.from, move.to, player);
-            if (see < -100) continue;
-        }
+        // No interior SEE filter — quiescence handles bad captures.
+        // (The old filter was: victimValue - attackerValue < -100, which rejected
+        //  every queen-takes-pawn because 100 - 900 = -800.)
 
         makeMoveOnBoard(b, move);
+        anyMoveSearched = true;
+
         if (isSquareAttackedBy(b, kingSq[player], enemy)) {
             unmakeMoveOnBoard(b, move);
             continue;
         }
 
-        // LMR: reduce late quiet moves
         let reduction = 0;
         const isQuiet = b[move.to] === 0;
         if (isQuiet && depth >= 3 && i >= 3) reduction = 1;
@@ -1012,7 +941,6 @@ function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
         if (i === 0) {
             score = minimax(b, depth - 1, alpha, beta, enemy, ply + 1, checkExt, true);
         } else {
-            // PVS: null-window search
             if (isMax) {
                 score = minimax(b, depth - 1 - reduction, alpha, alpha + 1, enemy, ply + 1, checkExt, true);
                 if (score > alpha && score < beta) {
@@ -1027,6 +955,8 @@ function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
         }
         unmakeMoveOnBoard(b, move);
 
+        if (!isFinite(score)) continue;
+
         if (isMax) {
             if (score > best) best = score;
             if (best > alpha) alpha = best;
@@ -1039,7 +969,8 @@ function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
     }
 
     searchLinePositions.pop();
-    return best;
+    if (!anyMoveSearched) return standPat;
+    return isFinite(best) ? best : 0;
 }
 
 // ============================================================
@@ -1058,7 +989,6 @@ function findBestMove() {
     const allMoves = getAllPossibleMovesForPosition(board, currentPlayer);
     if (allMoves.length === 0) return null;
 
-    // Immediate mate
     for (const move of allMoves) {
         makeMoveOnBoard(board, move);
         const enemy = enemyColor(currentPlayer);
@@ -1073,7 +1003,6 @@ function findBestMove() {
         unmakeMoveOnBoard(board, move);
     }
 
-    // Opening book
     if (openingBook && moveHistory.length < 12) {
         const bookMove = openingBook.getOpeningRecommendation(moveHistory);
         if (bookMove) {
@@ -1091,7 +1020,6 @@ function findBestMove() {
         }
     }
 
-    // Sort for ordering
     allMoves.sort((a, b1) => {
         const va = PIECE_VALUE_ARR[board[a.to]] || 0;
         const vb = PIECE_VALUE_ARR[board[b1.to]] || 0;
@@ -1108,8 +1036,11 @@ function findBestMove() {
     console.log(`🔍 ${currentPlayer.toUpperCase()} searching depth ${maxDepth}`);
 
     for (let depth = 1; depth <= maxDepth; depth++) {
+        if (searchAborted && depth > 1) break;
+
         let iterBestMove = null;
         let iterBestEval = currentPlayer === 'white' ? -Infinity : Infinity;
+        const scores = new Map();
 
         for (const move of allMoves) {
             if (searchAborted) break;
@@ -1121,6 +1052,10 @@ function findBestMove() {
             }
             const score = minimax(board, depth - 1, -Infinity, Infinity, enemy, 0, 0, true);
             unmakeMoveOnBoard(board, move);
+
+            if (!isFinite(score)) continue;
+
+            scores.set(move, score);
 
             console.log(`   root: ${toSAN(board, move, currentPlayer)} = ${score.toFixed(1)}`);
 
@@ -1137,12 +1072,14 @@ function findBestMove() {
             bestEval = iterBestEval;
             lastDepth = depth;
             allMoves.sort((a, b1) => {
-                if (a === iterBestMove) return -1;
-                if (b1 === iterBestMove) return 1;
-                return 0;
+                const sa = scores.get(a);
+                const sb = scores.get(b1);
+                if (sa === undefined && sb === undefined) return 0;
+                if (sa === undefined) return 1;
+                if (sb === undefined) return -1;
+                return currentPlayer === 'white' ? sb - sa : sa - sb;
             });
         }
-        if (searchAborted) break;
     }
 
     const elapsed = (performance.now() - searchStartTime).toFixed(0);
@@ -1262,7 +1199,6 @@ function playMove(fromRow, fromCol, toRow, toCol) {
     }
     if (!chosen) return;
 
-    // Save history
     gameHistory.push({
         boardCopy: new Int8Array(board),
         kingSqCopy: { ...kingSq },
@@ -1284,8 +1220,6 @@ function playMove(fromRow, fromCol, toRow, toCol) {
     if (currentPlayer === 'black') moveCount++;
     currentPlayer = enemyColor(currentPlayer);
 
-    // Prune eval cache to current line
-    // (Simplified: just clear it every so often)
     if (evalCache.size > 100000) evalCache.clear();
 
     updateMoveHistory();
@@ -1463,7 +1397,6 @@ function changeGameMode() {
 }
 
 function changeTimeControl() {
-    // Time controls not yet migrated to v2.6.0
     const sel = document.getElementById('timeControl');
     console.log(`⏱️ Time control changed to: ${sel ? sel.value : 'unlimited'}`);
 }
@@ -1509,4 +1442,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - int board, make/unmake, PVS, null-move`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - interior SEE removed, non-finite guards added`);
