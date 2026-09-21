@@ -1,8 +1,9 @@
 // chess-game.js
-// VERSION: 2.6.4 - Repetition awareness at root + game-history seeding
+// VERSION: 2.6.5 - King safety bonus (gated on enemy material), connected rooks,
+//                 opening book now receives UCI history, tighter king-escape count
 // COMPATIBLE WITH: chess-ai-database.js (v2.0), index.html, chess-game-database.js (v1.1)
 
-const GAME_VERSION = "2.6.4";
+const GAME_VERSION = "2.6.5";
 
 // ============================================================
 // PIECE CODES
@@ -84,7 +85,8 @@ let moveCount = 1;
 
 let selectedSquare = null;
 let gameHistory = [];
-let moveHistory = [];
+let moveHistory = [];      // SAN, for display
+let uciHistory = [];       // UCI (e.g. 'e2e4'), for opening book lookup
 let lastMove = null;
 let gameOver = false;
 let gameMode = 'ai';
@@ -633,6 +635,8 @@ function evaluatePositionForSearch(b, player, moveNumber) {
 
     let score = 0;
     let pieceCount = 0;
+    let wNonPawnMaterial = 0;
+    let bNonPawnMaterial = 0;
 
     // Count undeveloped minor pieces per side (used by the queen penalty below)
     let wUndevelopedMinors = 0;
@@ -657,8 +661,14 @@ function evaluatePositionForSearch(b, player, moveNumber) {
         else score -= v;
         if (pieceType(p) !== 6) pieceCount++;
 
+        const pt = pieceType(p);
+        if (pt !== 1 && pt !== 6) {
+            if (isWhitePiece(p)) wNonPawnMaterial += v;
+            else bNonPawnMaterial += v;
+        }
+
         const mob = pieceMobility(b, sq, isWhitePiece(p) ? 'white' : 'black');
-        const weight = pieceType(p) === 2 ? 8 : pieceType(p) === 3 ? 6 : pieceType(p) === 4 ? 4 : pieceType(p) === 5 ? 1 : 1;
+        const weight = pt === 2 ? 8 : pt === 3 ? 6 : pt === 4 ? 4 : pt === 5 ? 1 : 1;
         score += (isWhitePiece(p) ? 1 : -1) * mob * weight * 0.5;
 
         const r = sq >> 3, c = sq & 7;
@@ -666,7 +676,6 @@ function evaluatePositionForSearch(b, player, moveNumber) {
         const centerBonus = Math.max(0, 7 - centerDist * 1.5);
         score += (isWhitePiece(p) ? 1 : -1) * centerBonus * 0.5;
 
-        const pt = pieceType(p);
         const isWhite = isWhitePiece(p);
 
         if (pt === 2 || pt === 3) {
@@ -686,7 +695,71 @@ function evaluatePositionForSearch(b, player, moveNumber) {
         }
     }
 
+    // ============================================================
+    // CONNECTED ROOKS
+    // Two friendly rooks on the same rank or file, with all squares
+    // between them empty. +20 each side. (v2.6.5)
+    // ============================================================
+    function countConnectedRooks(b, code) {
+        const rooks = [];
+        for (let sq = 0; sq < 64; sq++) if (b[sq] === code) rooks.push(sq);
+        if (rooks.length < 2) return 0;
+        let count = 0;
+        for (let i = 0; i < rooks.length; i++) {
+            for (let j = i + 1; j < rooks.length; j++) {
+                const a = rooks[i], c = rooks[j];
+                const ar = a >> 3, ac = a & 7;
+                const cr = c >> 3, cc = c & 7;
+                if (ar === cr) {
+                    const lo = Math.min(ac, cc), hi = Math.max(ac, cc);
+                    let clear = true;
+                    for (let x = lo + 1; x < hi; x++) {
+                        if (b[sqFromRC(ar, x)] !== 0) { clear = false; break; }
+                    }
+                    if (clear) count++;
+                } else if (ac === cc) {
+                    const lo = Math.min(ar, cr), hi = Math.max(ar, cr);
+                    let clear = true;
+                    for (let x = lo + 1; x < hi; x++) {
+                        if (b[sqFromRC(x, ac)] !== 0) { clear = false; break; }
+                    }
+                    if (clear) count++;
+                }
+            }
+        }
+        return count;
+    }
+    score += 20 * countConnectedRooks(b, WR);
+    score -= 20 * countConnectedRooks(b, BR);
+
+    // ============================================================
+    // KING SAFETY BONUS (v2.6.5)
+    // Gated on *enemy* non-pawn attacking material. When the opponent
+    // has fewer than ~3 minor pieces' worth of non-pawn material,
+    // the bonus turns off and the king is free to activate in the
+    // endgame. White's bonus depends on Black's material and vice
+    // versa — so a side up a queen doesn't keep refusing to march
+    // its king once the enemy has nothing left to attack with.
+    // ============================================================
+    const KING_SAFETY_THRESHOLD = 900;  // ~3 minor pieces' worth
+    const KING_SAFETY_BONUS = 45;
+
     const wKing = kingSq.white, bKing = kingSq.black;
+    const wKingRow = wKing >> 3, wKingCol = wKing & 7;
+    const bKingRow = bKing >> 3, bKingCol = bKing & 7;
+
+    // White's king is safe if: on back rank, not on e-file, and the
+    // enemy still has attacking material to worry about.
+    if (bNonPawnMaterial >= KING_SAFETY_THRESHOLD) {
+        if (wKingRow === 7 && wKingCol !== 4) score += KING_SAFETY_BONUS;
+    }
+    if (wNonPawnMaterial >= KING_SAFETY_THRESHOLD) {
+        if (bKingRow === 0 && bKingCol !== 4) score -= KING_SAFETY_BONUS;
+    }
+
+    // ============================================================
+    // KING DANGER (existing, with tightened escape-square count)
+    // ============================================================
     let wKingDanger = 0, bKingDanger = 0;
     let wKingEscapes = 0, bKingEscapes = 0;
 
@@ -704,17 +777,18 @@ function evaluatePositionForSearch(b, player, moveNumber) {
 
     if (isSquareAttackedBy(b, wKing, 'black')) wKingDanger += 200;
     if (isSquareAttackedBy(b, bKing, 'white')) bKingDanger += 200;
+
+    // Tightened: an escape square must be empty AND unattacked.
+    // Previously the predicate also counted squares holding an enemy
+    // piece as escapes, which overcounted (a king can't "escape" onto
+    // an occupied square — it can capture, but only if undefended).
     for (let i = 0; i < KING_DEGREE[wKing]; i++) {
         const t = KING_ATTACKS[wKing * 8 + i];
-        if (b[t] === 0 || isBlackPiece(b[t])) {
-            if (!isSquareAttackedBy(b, t, 'black')) wKingEscapes++;
-        }
+        if (b[t] === 0 && !isSquareAttackedBy(b, t, 'black')) wKingEscapes++;
     }
     for (let i = 0; i < KING_DEGREE[bKing]; i++) {
         const t = KING_ATTACKS[bKing * 8 + i];
-        if (b[t] === 0 || isWhitePiece(b[t])) {
-            if (!isSquareAttackedBy(b, t, 'white')) bKingEscapes++;
-        }
+        if (b[t] === 0 && !isSquareAttackedBy(b, t, 'white')) bKingEscapes++;
     }
     if (wKingEscapes === 0) wKingDanger += 300;
     if (bKingEscapes === 0) bKingDanger += 300;
@@ -994,9 +1068,7 @@ function findBestMove() {
     rootEvalWhite = evaluatePositionForSearch(board, currentPlayer, moveCount);
     avoidRepetition = Math.abs(rootEvalWhite) > 150;
 
-    // REPETITION FIX A: seed searchLinePositions with every position the game
-    // has reached. Now, when the search explores a candidate move that leads back
-    // to a position already seen in the game, it's recognized as a repetition.
+    // Seed searchLinePositions with every position the game has reached.
     for (const state of gameHistory) {
         searchLinePositions.push(boardToHash(state.boardCopy) + state.currentPlayerCopy[0]);
     }
@@ -1005,10 +1077,9 @@ function findBestMove() {
     const allMoves = getAllPossibleMovesForPosition(board, currentPlayer);
     if (allMoves.length === 0) return null;
 
-    // REPETITION FIX B: at the root, drop candidate moves whose resulting position
-    // has already been seen 2+ times in the game — playing them would immediately
-    // create a 3-fold draw. Only do this when we're decisively winning; if we're
-    // losing or drawing, allowing repetition is fine (it's the best we can get).
+    // At the root, drop candidate moves whose resulting position has
+    // already been seen 2+ times in the game — playing them would
+    // immediately create a 3-fold draw. Only when decisively winning.
     const isWinningSide = (currentPlayer === 'white' && rootEvalWhite > 200) ||
                           (currentPlayer === 'black' && rootEvalWhite < -200);
     const playerToMoveInResult = enemyColor(currentPlayer);
@@ -1027,12 +1098,11 @@ function findBestMove() {
             }
         }
         if (candidateMoves.length === 0) {
-            // Everything leads to a repetition. Fall back to all moves (draw may be forced).
             candidateMoves = allMoves;
         }
     }
 
-    // Immediate mate check (on all moves, since mate-in-1 can't repeat)
+    // Immediate mate check
     for (const move of allMoves) {
         makeMoveOnBoard(board, move);
         const enemy = enemyColor(currentPlayer);
@@ -1047,8 +1117,10 @@ function findBestMove() {
         unmakeMoveOnBoard(board, move);
     }
 
-    if (openingBook && moveHistory.length < 12) {
-        const bookMove = openingBook.getOpeningRecommendation(moveHistory);
+    // Opening book — pass UCI history, not SAN, because the book is
+    // keyed by UCI strings like 'e2e4'. (v2.6.5 fix.)
+    if (openingBook && uciHistory.length < 12) {
+        const bookMove = openingBook.getOpeningRecommendation(uciHistory);
         if (bookMove) {
             const parsed = parseAlgebraicMove(bookMove);
             if (parsed) {
@@ -1260,6 +1332,7 @@ function playMove(fromRow, fromCol, toRow, toCol) {
 
     lastMove = { fromRow, fromCol, toRow, toCol };
     moveHistory.push(san);
+    uciHistory.push(sqName(from) + sqName(to));
 
     if (currentPlayer === 'black') moveCount++;
     currentPlayer = enemyColor(currentPlayer);
@@ -1381,6 +1454,7 @@ function newGame() {
     selectedSquare = null;
     gameHistory = [];
     moveHistory = [];
+    uciHistory = [];
     gameOver = false;
     moveCount = 1;
     halfMoveCount = 0;
@@ -1408,7 +1482,6 @@ function newGame() {
 function undoMove() {
     if (gameHistory.length === 0) return;
 
-    // Decrement the count of the position we're undoing back to
     const currentKey = boardToHash(board) + currentPlayer[0];
     const cnt = gamePositionCounts.get(currentKey) || 1;
     if (cnt <= 1) gamePositionCounts.delete(currentKey);
@@ -1425,6 +1498,7 @@ function undoMove() {
     currentPlayer = prev.currentPlayerCopy;
     lastMove = prev.lastMoveCopy;
     moveHistory.pop();
+    uciHistory.pop();
     gameOver = false;
 
     createBoard();
@@ -1482,7 +1556,6 @@ window.addEventListener('load', function() {
         console.log('♟️ Endgame Engine loaded');
     }
 
-    // Initialize repetition tracking for the starting position
     gamePositionCounts.set(boardToHash(board) + 'w', 1);
 
     createBoard();
@@ -1502,4 +1575,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - repetition awareness at root`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - king safety, connected rooks, UCI book`);
