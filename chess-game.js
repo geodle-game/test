@@ -1,8 +1,8 @@
 // chess-game.js
-// VERSION: 2.6.2 - Development + early-queen penalties, reduced queen mobility weight
+// VERSION: 2.6.4 - Repetition awareness at root + game-history seeding
 // COMPATIBLE WITH: chess-ai-database.js (v2.0), index.html, chess-game-database.js (v1.1)
 
-const GAME_VERSION = "2.6.2";
+const GAME_VERSION = "2.6.4";
 
 // ============================================================
 // PIECE CODES
@@ -97,6 +97,9 @@ let endgameEngine = null;
 let patternLearner = null;
 let openingBook = null;
 let moveTree = null;
+
+// Position repetition tracking across the whole game
+let gamePositionCounts = new Map();
 
 // ============================================================
 // BOARD INIT
@@ -631,6 +634,21 @@ function evaluatePositionForSearch(b, player, moveNumber) {
     let score = 0;
     let pieceCount = 0;
 
+    // Count undeveloped minor pieces per side (used by the queen penalty below)
+    let wUndevelopedMinors = 0;
+    let bUndevelopedMinors = 0;
+    for (let sq = 0; sq < 64; sq++) {
+        const p = b[sq];
+        if (p === 0) continue;
+        const pt = pieceType(p);
+        if (pt !== 2 && pt !== 3) continue;
+        const backRank = isWhitePiece(p) ? 7 : 0;
+        if ((sq >> 3) === backRank) {
+            if (isWhitePiece(p)) wUndevelopedMinors++;
+            else bUndevelopedMinors++;
+        }
+    }
+
     for (let sq = 0; sq < 64; sq++) {
         const p = b[sq];
         if (p === 0) continue;
@@ -640,8 +658,6 @@ function evaluatePositionForSearch(b, player, moveNumber) {
         if (pieceType(p) !== 6) pieceCount++;
 
         const mob = pieceMobility(b, sq, isWhitePiece(p) ? 'white' : 'black');
-        // Reduced queen mobility weight (was 3, now 1) so that a developed
-        // queen does not outscore developing knights and bishops.
         const weight = pieceType(p) === 2 ? 8 : pieceType(p) === 3 ? 6 : pieceType(p) === 4 ? 4 : pieceType(p) === 5 ? 1 : 1;
         score += (isWhitePiece(p) ? 1 : -1) * mob * weight * 0.5;
 
@@ -650,20 +666,22 @@ function evaluatePositionForSearch(b, player, moveNumber) {
         const centerBonus = Math.max(0, 7 - centerDist * 1.5);
         score += (isWhitePiece(p) ? 1 : -1) * centerBonus * 0.5;
 
-        // Development penalty: knights/bishops still on their starting squares.
         const pt = pieceType(p);
         const isWhite = isWhitePiece(p);
+
         if (pt === 2 || pt === 3) {
             const backRank = isWhite ? 7 : 0;
             if ((sq >> 3) === backRank) {
                 score += isWhite ? (pt === 2 ? -25 : -15) : (pt === 2 ? 25 : 15);
             }
         }
-        // Early-queen penalty: queen off its starting square before move 10.
-        if (pt === 5 && moveNumber < 10) {
-            const startSq = isWhite ? 59 : 3;   // d1 = 59, d8 = 3
+
+        if (pt === 5) {
+            const startSq = isWhite ? 59 : 3;
             if (sq !== startSq) {
-                score += isWhite ? -20 : 20;
+                const ownUndeveloped = isWhite ? wUndevelopedMinors : bUndevelopedMinors;
+                const penalty = 30 * ownUndeveloped;
+                score += isWhite ? -penalty : penalty;
             }
         }
     }
@@ -704,7 +722,6 @@ function evaluatePositionForSearch(b, player, moveNumber) {
     score -= wKingDanger * 0.5;
     score += bKingDanger * 0.5;
 
-    // Pawn advancement (no rank-4 bonus — a pawn there isn't threatening anything)
     for (let sq = 0; sq < 64; sq++) {
         const p = b[sq];
         if (p === WP) {
@@ -751,7 +768,7 @@ function hasNonPawnMaterial(b, player) {
 }
 
 // ============================================================
-// SEE (Static Exchange Evaluation)
+// SEE
 // ============================================================
 function evaluateCaptureSafety(b, from, to, player) {
     const victim = b[to];
@@ -977,9 +994,45 @@ function findBestMove() {
     rootEvalWhite = evaluatePositionForSearch(board, currentPlayer, moveCount);
     avoidRepetition = Math.abs(rootEvalWhite) > 150;
 
+    // REPETITION FIX A: seed searchLinePositions with every position the game
+    // has reached. Now, when the search explores a candidate move that leads back
+    // to a position already seen in the game, it's recognized as a repetition.
+    for (const state of gameHistory) {
+        searchLinePositions.push(boardToHash(state.boardCopy) + state.currentPlayerCopy[0]);
+    }
+    searchLinePositions.push(boardToHash(board) + currentPlayer[0]);
+
     const allMoves = getAllPossibleMovesForPosition(board, currentPlayer);
     if (allMoves.length === 0) return null;
 
+    // REPETITION FIX B: at the root, drop candidate moves whose resulting position
+    // has already been seen 2+ times in the game — playing them would immediately
+    // create a 3-fold draw. Only do this when we're decisively winning; if we're
+    // losing or drawing, allowing repetition is fine (it's the best we can get).
+    const isWinningSide = (currentPlayer === 'white' && rootEvalWhite > 200) ||
+                          (currentPlayer === 'black' && rootEvalWhite < -200);
+    const playerToMoveInResult = enemyColor(currentPlayer);
+    let candidateMoves = allMoves;
+    if (isWinningSide) {
+        candidateMoves = [];
+        for (const move of allMoves) {
+            makeMoveOnBoard(board, move);
+            const resultKey = boardToHash(board) + playerToMoveInResult[0];
+            unmakeMoveOnBoard(board, move);
+            const cnt = gamePositionCounts.get(resultKey) || 0;
+            if (cnt < 2) {
+                candidateMoves.push(move);
+            } else {
+                console.log(`⛔ Skipping ${toSAN(board, move, currentPlayer)} — would draw by repetition (count ${cnt})`);
+            }
+        }
+        if (candidateMoves.length === 0) {
+            // Everything leads to a repetition. Fall back to all moves (draw may be forced).
+            candidateMoves = allMoves;
+        }
+    }
+
+    // Immediate mate check (on all moves, since mate-in-1 can't repeat)
     for (const move of allMoves) {
         makeMoveOnBoard(board, move);
         const enemy = enemyColor(currentPlayer);
@@ -1001,7 +1054,7 @@ function findBestMove() {
             if (parsed) {
                 const from = sqFromRC(parsed.fromRow, parsed.fromCol);
                 const to = sqFromRC(parsed.toRow, parsed.toCol);
-                for (const m of allMoves) {
+                for (const m of candidateMoves) {
                     if (m.from === from && m.to === to) {
                         console.log(`📖 Book: ${bookMove}`);
                         return m;
@@ -1011,7 +1064,7 @@ function findBestMove() {
         }
     }
 
-    allMoves.sort((a, b1) => {
+    candidateMoves.sort((a, b1) => {
         const va = PIECE_VALUE_ARR[board[a.to]] || 0;
         const vb = PIECE_VALUE_ARR[board[b1.to]] || 0;
         return vb - va;
@@ -1020,7 +1073,7 @@ function findBestMove() {
     const isEndgame = isEndgamePositionForPosition(board);
     const maxDepth = isEndgame ? SEARCH_CONFIG.endgameDepth : SEARCH_CONFIG.baseDepth;
 
-    let bestMove = allMoves[0];
+    let bestMove = candidateMoves[0];
     let bestEval = currentPlayer === 'white' ? -Infinity : Infinity;
     let lastDepth = 0;
 
@@ -1033,7 +1086,7 @@ function findBestMove() {
         let iterBestEval = currentPlayer === 'white' ? -Infinity : Infinity;
         const scores = new Map();
 
-        for (const move of allMoves) {
+        for (const move of candidateMoves) {
             if (searchAborted) break;
             makeMoveOnBoard(board, move);
             const enemy = enemyColor(currentPlayer);
@@ -1062,7 +1115,7 @@ function findBestMove() {
             bestMove = iterBestMove;
             bestEval = iterBestEval;
             lastDepth = depth;
-            allMoves.sort((a, b1) => {
+            candidateMoves.sort((a, b1) => {
                 const sa = scores.get(a);
                 const sb = scores.get(b1);
                 if (sa === undefined && sb === undefined) return 0;
@@ -1211,6 +1264,10 @@ function playMove(fromRow, fromCol, toRow, toCol) {
     if (currentPlayer === 'black') moveCount++;
     currentPlayer = enemyColor(currentPlayer);
 
+    // Track repetition for the resulting position
+    const resultKey = boardToHash(board) + currentPlayer[0];
+    gamePositionCounts.set(resultKey, (gamePositionCounts.get(resultKey) || 0) + 1);
+
     if (evalCache.size > 100000) evalCache.clear();
 
     updateMoveHistory();
@@ -1333,6 +1390,8 @@ function newGame() {
                        blackKingside: true, blackQueenside: true };
     enPassantTarget = null;
     evalCache.clear();
+    gamePositionCounts = new Map();
+    gamePositionCounts.set(boardToHash(board) + 'w', 1);
 
     createBoard();
     updateStatus();
@@ -1348,6 +1407,13 @@ function newGame() {
 
 function undoMove() {
     if (gameHistory.length === 0) return;
+
+    // Decrement the count of the position we're undoing back to
+    const currentKey = boardToHash(board) + currentPlayer[0];
+    const cnt = gamePositionCounts.get(currentKey) || 1;
+    if (cnt <= 1) gamePositionCounts.delete(currentKey);
+    else gamePositionCounts.set(currentKey, cnt - 1);
+
     const prev = gameHistory.pop();
     board = prev.boardCopy;
     kingSq.white = prev.kingSqCopy.white;
@@ -1416,6 +1482,9 @@ window.addEventListener('load', function() {
         console.log('♟️ Endgame Engine loaded');
     }
 
+    // Initialize repetition tracking for the starting position
+    gamePositionCounts.set(boardToHash(board) + 'w', 1);
+
     createBoard();
     updateStatus();
     updateMoveHistory();
@@ -1433,4 +1502,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - development + early-queen penalties`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - repetition awareness at root`);
