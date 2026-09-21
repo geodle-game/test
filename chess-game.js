@@ -1,9 +1,8 @@
 // chess-game.js
-// VERSION: 2.6.5 - King safety bonus (gated on enemy material), connected rooks,
-//                 opening book now receives UCI history, tighter king-escape count
+// VERSION: 2.6.6 - Root alpha-beta, killer moves, LMR fix, depth 5/7/8
 // COMPATIBLE WITH: chess-ai-database.js (v2.0), index.html, chess-game-database.js (v1.1)
 
-const GAME_VERSION = "2.6.5";
+const GAME_VERSION = "2.6.6";
 
 // ============================================================
 // PIECE CODES
@@ -638,7 +637,6 @@ function evaluatePositionForSearch(b, player, moveNumber) {
     let wNonPawnMaterial = 0;
     let bNonPawnMaterial = 0;
 
-    // Count undeveloped minor pieces per side (used by the queen penalty below)
     let wUndevelopedMinors = 0;
     let bUndevelopedMinors = 0;
     for (let sq = 0; sq < 64; sq++) {
@@ -695,11 +693,7 @@ function evaluatePositionForSearch(b, player, moveNumber) {
         }
     }
 
-    // ============================================================
     // CONNECTED ROOKS
-    // Two friendly rooks on the same rank or file, with all squares
-    // between them empty. +20 each side. (v2.6.5)
-    // ============================================================
     function countConnectedRooks(b, code) {
         const rooks = [];
         for (let sq = 0; sq < 64; sq++) if (b[sq] === code) rooks.push(sq);
@@ -732,24 +726,14 @@ function evaluatePositionForSearch(b, player, moveNumber) {
     score += 20 * countConnectedRooks(b, WR);
     score -= 20 * countConnectedRooks(b, BR);
 
-    // ============================================================
-    // KING SAFETY BONUS (v2.6.5)
-    // Gated on *enemy* non-pawn attacking material. When the opponent
-    // has fewer than ~3 minor pieces' worth of non-pawn material,
-    // the bonus turns off and the king is free to activate in the
-    // endgame. White's bonus depends on Black's material and vice
-    // versa — so a side up a queen doesn't keep refusing to march
-    // its king once the enemy has nothing left to attack with.
-    // ============================================================
-    const KING_SAFETY_THRESHOLD = 900;  // ~3 minor pieces' worth
+    // KING SAFETY BONUS (gated on enemy non-pawn material)
+    const KING_SAFETY_THRESHOLD = 900;
     const KING_SAFETY_BONUS = 45;
 
     const wKing = kingSq.white, bKing = kingSq.black;
     const wKingRow = wKing >> 3, wKingCol = wKing & 7;
     const bKingRow = bKing >> 3, bKingCol = bKing & 7;
 
-    // White's king is safe if: on back rank, not on e-file, and the
-    // enemy still has attacking material to worry about.
     if (bNonPawnMaterial >= KING_SAFETY_THRESHOLD) {
         if (wKingRow === 7 && wKingCol !== 4) score += KING_SAFETY_BONUS;
     }
@@ -757,9 +741,7 @@ function evaluatePositionForSearch(b, player, moveNumber) {
         if (bKingRow === 0 && bKingCol !== 4) score -= KING_SAFETY_BONUS;
     }
 
-    // ============================================================
-    // KING DANGER (existing, with tightened escape-square count)
-    // ============================================================
+    // KING DANGER
     let wKingDanger = 0, bKingDanger = 0;
     let wKingEscapes = 0, bKingEscapes = 0;
 
@@ -778,10 +760,6 @@ function evaluatePositionForSearch(b, player, moveNumber) {
     if (isSquareAttackedBy(b, wKing, 'black')) wKingDanger += 200;
     if (isSquareAttackedBy(b, bKing, 'white')) bKingDanger += 200;
 
-    // Tightened: an escape square must be empty AND unattacked.
-    // Previously the predicate also counted squares holding an enemy
-    // piece as escapes, which overcounted (a king can't "escape" onto
-    // an occupied square — it can capture, but only if undefended).
     for (let i = 0; i < KING_DEGREE[wKing]; i++) {
         const t = KING_ATTACKS[wKing * 8 + i];
         if (b[t] === 0 && !isSquareAttackedBy(b, t, 'black')) wKingEscapes++;
@@ -842,7 +820,7 @@ function hasNonPawnMaterial(b, player) {
 }
 
 // ============================================================
-// SEE
+// SEE (legacy, unused)
 // ============================================================
 function evaluateCaptureSafety(b, from, to, player) {
     const victim = b[to];
@@ -857,10 +835,10 @@ function evaluateCaptureSafety(b, from, to, player) {
 // SEARCH
 // ============================================================
 const SEARCH_CONFIG = {
-    baseDepth: 4,
-    endgameDepth: 6,
+    baseDepth: 5,
+    endgameDepth: 7,
     quiescenceDepth: 3,
-    hardMaxDepth: 6
+    hardMaxDepth: 8
 };
 
 let searchStartTime = 0;
@@ -872,6 +850,34 @@ let searchLinePositions = [];
 let avoidRepetition = false;
 let rootEvalWhite = 0;
 const REPETITION_PENALTY = 30;
+
+// Killer moves: two quiet moves per ply that recently caused a beta cutoff.
+// Reset at the start of every findBestMove(). Not persisted, not position-indexed.
+const MAX_PLY = 64;
+let killerMoves = [];
+
+function resetKillerMoves() {
+    killerMoves = new Array(MAX_PLY);
+    for (let i = 0; i < MAX_PLY; i++) killerMoves[i] = [null, null];
+}
+
+function storeKiller(ply, move) {
+    if (ply >= MAX_PLY) return;
+    const k = killerMoves[ply];
+    if (k[0] && k[0].from === move.from && k[0].to === move.to) return;
+    k[1] = k[0];
+    k[0] = { from: move.from, to: move.to };
+}
+
+function orderScore(b, move, killers) {
+    const captureVal = PIECE_VALUE_ARR[b[move.to]] || 0;
+    if (captureVal > 0) return 100000 + captureVal;
+    if (killers) {
+        if (killers[0] && move.from === killers[0].from && move.to === killers[0].to) return 90000;
+        if (killers[1] && move.from === killers[1].from && move.to === killers[1].to) return 80000;
+    }
+    return 0;
+}
 
 function checkTimeOut() {
     nodesSearched++;
@@ -992,11 +998,9 @@ function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
         if (player === 'black' && nullScore <= alpha) { searchLinePositions.pop(); return alpha; }
     }
 
-    moves.sort((a, b1) => {
-        const va = PIECE_VALUE_ARR[b[a.to]] || 0;
-        const vb = PIECE_VALUE_ARR[b[b1.to]] || 0;
-        return vb - va;
-    });
+    // Killer-move ordering: captures first (MVV-LVA), then killers, then quiet.
+    const killers = (ply < MAX_PLY) ? killerMoves[ply] : null;
+    moves.sort((a, b1) => orderScore(b, b1, killers) - orderScore(b, a, killers));
 
     const isMax = (player === 'white');
     const standPat = evaluatePositionForSearch(b, player, moveCount);
@@ -1015,8 +1019,10 @@ function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
             continue;
         }
 
+        // LMR fix: check capture status via undo, not the (already moved) board.
+        const isQuiet = move.undo.captured === 0;
+
         let reduction = 0;
-        const isQuiet = b[move.to] === 0;
         if (isQuiet && depth >= 3 && i >= 3) reduction = 1;
 
         let score;
@@ -1042,11 +1048,17 @@ function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
         if (isMax) {
             if (score > best) best = score;
             if (best > alpha) alpha = best;
-            if (alpha >= beta) break;
+            if (alpha >= beta) {
+                if (isQuiet) storeKiller(ply, move);
+                break;
+            }
         } else {
             if (score < best) best = score;
             if (best < beta) beta = best;
-            if (beta <= alpha) break;
+            if (beta <= alpha) {
+                if (isQuiet) storeKiller(ply, move);
+                break;
+            }
         }
     }
 
@@ -1064,11 +1076,11 @@ function findBestMove() {
     searchAborted = false;
     nodesSearched = 0;
     searchLinePositions = [];
+    resetKillerMoves();
 
     rootEvalWhite = evaluatePositionForSearch(board, currentPlayer, moveCount);
     avoidRepetition = Math.abs(rootEvalWhite) > 150;
 
-    // Seed searchLinePositions with every position the game has reached.
     for (const state of gameHistory) {
         searchLinePositions.push(boardToHash(state.boardCopy) + state.currentPlayerCopy[0]);
     }
@@ -1077,9 +1089,6 @@ function findBestMove() {
     const allMoves = getAllPossibleMovesForPosition(board, currentPlayer);
     if (allMoves.length === 0) return null;
 
-    // At the root, drop candidate moves whose resulting position has
-    // already been seen 2+ times in the game — playing them would
-    // immediately create a 3-fold draw. Only when decisively winning.
     const isWinningSide = (currentPlayer === 'white' && rootEvalWhite > 200) ||
                           (currentPlayer === 'black' && rootEvalWhite < -200);
     const playerToMoveInResult = enemyColor(currentPlayer);
@@ -1117,8 +1126,7 @@ function findBestMove() {
         unmakeMoveOnBoard(board, move);
     }
 
-    // Opening book — pass UCI history, not SAN, because the book is
-    // keyed by UCI strings like 'e2e4'. (v2.6.5 fix.)
+    // Opening book — pass UCI history (book is keyed by UCI, not SAN).
     if (openingBook && uciHistory.length < 12) {
         const bookMove = openingBook.getOpeningRecommendation(uciHistory);
         if (bookMove) {
@@ -1158,6 +1166,12 @@ function findBestMove() {
         let iterBestEval = currentPlayer === 'white' ? -Infinity : Infinity;
         const scores = new Map();
 
+        // Root alpha-beta: share alpha/beta across root moves so later
+        // candidates fail low early. Non-best moves log a BOUND, not their
+        // exact value. The best move's score is always exact.
+        let rootAlpha = -Infinity;
+        let rootBeta = Infinity;
+
         for (const move of candidateMoves) {
             if (searchAborted) break;
             makeMoveOnBoard(board, move);
@@ -1166,7 +1180,7 @@ function findBestMove() {
                 unmakeMoveOnBoard(board, move);
                 continue;
             }
-            const score = minimax(board, depth - 1, -Infinity, Infinity, enemy, 0, 0, true);
+            const score = minimax(board, depth - 1, rootAlpha, rootBeta, enemy, 0, 0, true);
             unmakeMoveOnBoard(board, move);
 
             if (!isFinite(score)) continue;
@@ -1175,10 +1189,12 @@ function findBestMove() {
 
             console.log(`   root: ${toSAN(board, move, currentPlayer)} = ${score.toFixed(1)}`);
 
-            const isBetter = currentPlayer === 'white' ? score > iterBestEval : score < iterBestEval;
-            if (iterBestMove === null || isBetter) {
-                iterBestMove = move;
-                iterBestEval = score;
+            if (currentPlayer === 'white') {
+                if (score > iterBestEval) { iterBestMove = move; iterBestEval = score; }
+                if (score > rootAlpha) rootAlpha = score;
+            } else {
+                if (score < iterBestEval) { iterBestMove = move; iterBestEval = score; }
+                if (score < rootBeta) rootBeta = score;
             }
         }
 
@@ -1337,7 +1353,6 @@ function playMove(fromRow, fromCol, toRow, toCol) {
     if (currentPlayer === 'black') moveCount++;
     currentPlayer = enemyColor(currentPlayer);
 
-    // Track repetition for the resulting position
     const resultKey = boardToHash(board) + currentPlayer[0];
     gamePositionCounts.set(resultKey, (gamePositionCounts.get(resultKey) || 0) + 1);
 
@@ -1575,4 +1590,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - king safety, connected rooks, UCI book`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - root alpha-beta, killers, LMR fix, depth 5`);
