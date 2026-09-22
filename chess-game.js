@@ -1,8 +1,8 @@
 // chess-game.js
-// VERSION: 2.7.4 - Endgame promotion urgency + passed-pawn bonus + king-driving
+// VERSION: 2.7.5 - Fixed endgame: capped pawn-advancement bonuses, K+P vs K technique, promotion ordering
 // COMPATIBLE WITH: chess-ai-database.js (v2.0), index.html, chess-game-database.js (v1.1)
 
-const GAME_VERSION = "2.7.4";
+const GAME_VERSION = "2.7.5";
 
 const USE_TT = true;
 const TT_BITS = 18;
@@ -1150,33 +1150,61 @@ function evaluatePositionForSearch(b, player, moveNumber) {
     score += bKingDanger * 0.5;
 
     // ============================================================
-    // PAWN PROMOTION (v2.7.4 - much higher values)
-    // A pawn one square from promotion is worth close to a queen,
-    // because next move it becomes one and the opponent can't stop it.
+    // PAWN ADVANCEMENT (v2.7.5)
+    // Bonuses must ALWAYS leave pawn+bonus < queen (900), otherwise
+    // the search prefers keeping a 7th-rank pawn over promoting it.
     // ============================================================
     for (let sq = 0; sq < 64; sq++) {
         const p = b[sq];
         if (p === WP) {
             const r = sq >> 3;
+            const passed = isPassedPawn(b, sq, true);
             if (r === 1) {
-                score += 900;
-                if (isPassedPawn(b, sq, true)) score += 400;
-            } else if (r === 2) {
                 score += 400;
-                if (isPassedPawn(b, sq, true)) score += 150;
+                if (passed) score += 150;   // pawn + bonus ≤ 650 < queen
+            } else if (r === 2) {
+                score += 150;
+                if (passed) score += 50;
             } else if (r === 3) {
-                score += 120;
+                score += 50;
             }
         } else if (p === BP) {
             const r = sq >> 3;
+            const passed = isPassedPawn(b, sq, false);
             if (r === 6) {
-                score -= 900;
-                if (isPassedPawn(b, sq, false)) score -= 400;
-            } else if (r === 5) {
                 score -= 400;
-                if (isPassedPawn(b, sq, false)) score -= 150;
+                if (passed) score -= 150;
+            } else if (r === 5) {
+                score -= 150;
+                if (passed) score -= 50;
             } else if (r === 4) {
-                score -= 120;
+                score -= 50;
+            }
+        }
+    }
+
+    // ============================================================
+    // K+P vs K endgame knowledge (v2.7.5)
+    // Reward:  king in front of the pawn, escorting it.
+    // Penalize: king stuck in the corner in front of its own pawn (draw).
+    // ============================================================
+    if (pieceCount <= 3) {
+        for (let sq = 0; sq < 64; sq++) {
+            const p = b[sq];
+            if (p !== WP && p !== BP) continue;
+            const pr = sq >> 3, pc = sq & 7;
+
+            if (p === WP) {
+                // White king in front of the pawn (winning shape)
+                if (wKingRow < pr && Math.abs(wKingCol - pc) <= 1) score += 120;
+                // White king on promotion rank blocking its own corner pawn (draw)
+                if (wKingRow === 0 && wKingCol === pc && (pc === 0 || pc === 7)) score -= 250;
+                // More general: king directly in front of a 7th-rank pawn
+                if (pr === 1 && wKingRow === 0 && Math.abs(wKingCol - pc) <= 1) score -= 80;
+            } else {
+                if (bKingRow > pr && Math.abs(bKingCol - pc) <= 1) score -= 120;
+                if (bKingRow === 7 && bKingCol === pc && (pc === 0 || pc === 7)) score += 250;
+                if (pr === 6 && bKingRow === 7 && Math.abs(bKingCol - pc) <= 1) score += 80;
             }
         }
     }
@@ -1186,15 +1214,22 @@ function evaluatePositionForSearch(b, player, moveNumber) {
         score -= ((bKing >> 3) + (7 - (bKing & 7))) * 3;
 
         // ============================================================
-        // v2.7.4: Drive enemy king to edge when decisively winning.
-        // In K+R vs K, K+Q vs K, etc., the fastest mate involves
-        // pushing the enemy king to the rim. This rewards that plan.
+        // v2.7.5: Only "drive the enemy king to the edge" when we have
+        // an actual mating force on the board (R/Q or 2+ minors ahead).
+        // Otherwise in K+P vs K we want to escort the pawn, not
+        // chase the king — and definitely not sac the pawn to do it.
         // ============================================================
         const wEdgeDist = Math.min(wKingRow, 7 - wKingRow, wKingCol, 7 - wKingCol);
         const bEdgeDist = Math.min(bKingRow, 7 - bKingRow, bKingCol, 7 - bKingCol);
-        if (materialDiff > 300) {
+
+        const wHeavy = wNonPawnMaterial - bNonPawnMaterial;
+        const bHeavy = bNonPawnMaterial - wNonPawnMaterial;
+        const hasMatingForce_White = wHeavy >= 500;   // at least a rook up in non-pawns
+        const hasMatingForce_Black = bHeavy >= 500;
+
+        if (materialDiff > 300 && hasMatingForce_White) {
             score += (3 - bEdgeDist) * 30;
-        } else if (materialDiff < -300) {
+        } else if (materialDiff < -300 && hasMatingForce_Black) {
             score -= (3 - wEdgeDist) * 30;
         }
     }
@@ -1580,7 +1615,15 @@ function findBestMove() {
         }
     }
 
+    // ============================================================
+    // v2.7.5: Promotion-first move ordering at the root.
+    // This ensures a queen-promotion is always examined before
+    // the search can prune to a shallow depth and miss it.
+    // ============================================================
     candidateMoves.sort((a, b1) => {
+        const aQueen = a.promo === 5 ? 1 : 0;
+        const bQueen = b1.promo === 5 ? 1 : 0;
+        if (aQueen !== bQueen) return bQueen - aQueen;
         const va = PIECE_VALUE_ARR[board[a.to]] || 0;
         const vb = PIECE_VALUE_ARR[board[b1.to]] || 0;
         return vb - va;
