@@ -1,8 +1,8 @@
 // chess-game.js
-// VERSION: 2.7.2 - Strategic eval terms + lower base depth
+// VERSION: 2.7.3 - Fix rook-file eval scope bug (ReferenceError: file)
 // COMPATIBLE WITH: chess-ai-database.js (v2.0), index.html, chess-game-database.js (v1.1)
 
-const GAME_VERSION = "2.7.2";
+const GAME_VERSION = "2.7.3";
 
 // ============================================================
 // KILL SWITCHES
@@ -921,11 +921,9 @@ function countShieldPawns(b, kSq, isWhite) {
     return count;
 }
 
-// v2.7.2: knight outpost (strict — no enemy pawn on adjacent files can ever attack).
 function isKnightOutpost(b, sq, isWhite) {
     const r = sq >> 3, c = sq & 7;
     if (r < 2 || r > 5) return false;
-    // Must be defended by a friendly pawn.
     let defended = false;
     if (isWhite) {
         if (c > 0 && r < 7 && b[sqFromRC(r+1, c-1)] === WP) defended = true;
@@ -940,14 +938,10 @@ function isKnightOutpost(b, sq, isWhite) {
         const f = c + df;
         if (f < 0 || f > 7) continue;
         if (isWhite) {
-            // White knight: black pawns attack downward. No black pawn may exist on
-            // file f at any row < r (from which it could advance to r-1 and attack r).
             for (let pr = 0; pr < r; pr++) {
                 if (b[sqFromRC(pr, f)] === enemyPawn) return false;
             }
         } else {
-            // Black knight: white pawns attack upward. No white pawn may exist on
-            // file f at any row > r.
             for (let pr = r + 1; pr < 8; pr++) {
                 if (b[sqFromRC(pr, f)] === enemyPawn) return false;
             }
@@ -956,7 +950,6 @@ function isKnightOutpost(b, sq, isWhite) {
     return true;
 }
 
-// v2.7.2: pawn storm danger — enemy pawns advancing toward our king.
 function pawnStormDanger(b, kSq, attackerIsWhite) {
     const kFile = kSq & 7;
     const attackerPawn = attackerIsWhite ? WP : BP;
@@ -1030,20 +1023,19 @@ function evaluatePositionForSearch(b, player, moveNumber) {
 
         const isWhite = isWhitePiece(p);
 
-        // Pawn structure terms (v2.7.2)
+        // Pawn structure terms
         if (pt === 1) {
-            const file = c;
             const pawn = p;
             // Doubled pawn
             let doubled = false;
             for (let rr = 0; rr < 8; rr++) {
-                if (rr !== r && b[sqFromRC(rr, file)] === pawn) { doubled = true; break; }
+                if (rr !== r && b[sqFromRC(rr, c)] === pawn) { doubled = true; break; }
             }
             if (doubled) score += isWhite ? -12 : 12;
             // Isolated pawn
             let isolated = true;
             for (const df of [-1, 1]) {
-                const f = file + df;
+                const f = c + df;
                 if (f < 0 || f > 7) continue;
                 for (let rr = 0; rr < 8; rr++) {
                     if (b[sqFromRC(rr, f)] === pawn) { isolated = false; break; }
@@ -1060,22 +1052,21 @@ function evaluatePositionForSearch(b, player, moveNumber) {
             }
         }
 
-        // Knight outpost (v2.7.2)
+        // Knight outpost
         if (pt === 2) {
             if (isKnightOutpost(b, sq, isWhite)) score += isWhite ? 30 : -30;
         }
 
-        // Rook file openness (v2.7.2)
+        // Rook file openness (v2.7.3 fix: use `c`, not an out-of-scope `file`)
         if (pt === 4) {
             const ownPawn = isWhite ? WP : BP;
             const enemyPawn = isWhite ? BP : WP;
             let hasOwn = false, hasEnemy = false;
             for (let rr = 0; rr < 8; rr++) {
-                const pp = b[sqFromRC(rr, file)];
+                const pp = b[sqFromRC(rr, c)];
                 if (pp === ownPawn) hasOwn = true;
                 else if (pp === enemyPawn) hasEnemy = true;
             }
-            // (reuse `file` from above — it's `c`)
             if (!hasOwn && !hasEnemy) score += isWhite ? 25 : -25;
             else if (!hasOwn) score += isWhite ? 12 : -12;
         }
@@ -1101,9 +1092,9 @@ function evaluatePositionForSearch(b, player, moveNumber) {
         let count = 0;
         for (let i = 0; i < rooks.length; i++) {
             for (let j = i + 1; j < rooks.length; j++) {
-                const a = rooks[i], c = rooks[j];
+                const a = rooks[i], c2 = rooks[j];
                 const ar = a >> 3, ac = a & 7;
-                const cr = c >> 3, cc = c & 7;
+                const cr = c2 >> 3, cc = c2 & 7;
                 if (ar === cr) {
                     const lo = Math.min(ac, cc), hi = Math.max(ac, cc);
                     let clear = true;
@@ -1159,7 +1150,6 @@ function evaluatePositionForSearch(b, player, moveNumber) {
         }
     }
 
-    // Pawn storm danger (v2.7.2)
     wKingDanger += pawnStormDanger(b, wKing, false);
     bKingDanger += pawnStormDanger(b, bKing, true);
 
@@ -1229,8 +1219,8 @@ function hasNonPawnMaterial(b, player) {
 // SEARCH
 // ============================================================
 const SEARCH_CONFIG = {
-    baseDepth: 4,          // v2.7.2: lowered from 5 (extension compensates)
-    endgameDepth: 6,       // v2.7.2: lowered from 7
+    baseDepth: 4,
+    endgameDepth: 6,
     quiescenceDepth: 3,
     hardMaxDepth: 8
 };
@@ -2118,4 +2108,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - strategic eval terms`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - rook-file eval fix`);
