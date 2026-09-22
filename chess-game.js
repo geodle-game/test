@@ -1,8 +1,14 @@
 // chess-game.js
-// VERSION: 2.7.0 - Working clock (Fischer increment), AI time budget tied to clock
+// VERSION: 2.7.1 - Zobrist hashing + per-search transposition table (kill switch: USE_TT)
 // COMPATIBLE WITH: chess-ai-database.js (v2.0), index.html, chess-game-database.js (v1.1)
 
-const GAME_VERSION = "2.7.0";
+const GAME_VERSION = "2.7.1";
+
+// ============================================================
+// KILL SWITCHES
+// ============================================================
+const USE_TT = true;          // transposition table (Zobrist-keyed, per-search)
+const TT_BITS = 18;           // 2^18 = 262144 entries (~4MB)
 
 // ============================================================
 // PIECE CODES
@@ -69,6 +75,156 @@ const KING_DEGREE = new Int8Array(64);
         while (deg < 8) KING_ATTACKS[sq * 8 + deg++] = -1;
     }
 })();
+
+// ============================================================
+// ZOBRIST HASH TABLES
+// ============================================================
+const ZOBRIST_PIECE_LO = [];
+const ZOBRIST_PIECE_HI = [];
+const ZOBRIST_SIDE_LO = (Math.random() * 0x100000000) | 0;
+const ZOBRIST_SIDE_HI = (Math.random() * 0x100000000) | 0;
+const ZOBRIST_CASTLE_LO = [];
+const ZOBRIST_CASTLE_HI = [];
+const ZOBRIST_EP_LO = [];
+const ZOBRIST_EP_HI = [];
+
+(function initZobrist() {
+    for (let p = 0; p <= 12; p++) {
+        const lo = new Int32Array(64);
+        const hi = new Int32Array(64);
+        for (let s = 0; s < 64; s++) {
+            lo[s] = (Math.random() * 0x100000000) | 0;
+            hi[s] = (Math.random() * 0x100000000) | 0;
+        }
+        ZOBRIST_PIECE_LO[p] = lo;
+        ZOBRIST_PIECE_HI[p] = hi;
+    }
+    for (let i = 0; i < 4; i++) {
+        ZOBRIST_CASTLE_LO[i] = (Math.random() * 0x100000000) | 0;
+        ZOBRIST_CASTLE_HI[i] = (Math.random() * 0x100000000) | 0;
+    }
+    for (let i = 0; i < 8; i++) {
+        ZOBRIST_EP_LO[i] = (Math.random() * 0x100000000) | 0;
+        ZOBRIST_EP_HI[i] = (Math.random() * 0x100000000) | 0;
+    }
+})();
+
+// Compute a 64-bit Zobrist hash (returned as two 32-bit halves) for a position.
+// Includes pieces, side to move, castling rights, and en passant.
+function computeHash(b, player) {
+    let lo = 0, hi = 0;
+    for (let sq = 0; sq < 64; sq++) {
+        const p = b[sq];
+        if (p !== 0) {
+            lo ^= ZOBRIST_PIECE_LO[p][sq];
+            hi ^= ZOBRIST_PIECE_HI[p][sq];
+        }
+    }
+    if (player === 'black') {
+        lo ^= ZOBRIST_SIDE_LO;
+        hi ^= ZOBRIST_SIDE_HI;
+    }
+    if (castlingRights.whiteKingside)  { lo ^= ZOBRIST_CASTLE_LO[0]; hi ^= ZOBRIST_CASTLE_HI[0]; }
+    if (castlingRights.whiteQueenside) { lo ^= ZOBRIST_CASTLE_LO[1]; hi ^= ZOBRIST_CASTLE_HI[1]; }
+    if (castlingRights.blackKingside)  { lo ^= ZOBRIST_CASTLE_LO[2]; hi ^= ZOBRIST_CASTLE_HI[2]; }
+    if (castlingRights.blackQueenside) { lo ^= ZOBRIST_CASTLE_LO[3]; hi ^= ZOBRIST_CASTLE_HI[3]; }
+    if (enPassantTarget) {
+        const f = enPassantTarget.sq & 7;
+        lo ^= ZOBRIST_EP_LO[f];
+        hi ^= ZOBRIST_EP_HI[f];
+    }
+    return { lo: lo | 0, hi: hi | 0 };
+}
+
+// ============================================================
+// TRANSPOSITION TABLE
+// ============================================================
+const TT_SIZE = 1 << TT_BITS;
+const TT_MASK = TT_SIZE - 1;
+const ttKeys   = new Int32Array(TT_SIZE);   // 32-bit key (hi)
+const ttVerify = new Int32Array(TT_SIZE);   // 32-bit verify (lo)
+const ttScore  = new Int32Array(TT_SIZE);
+const ttDepth  = new Int8Array(TT_SIZE);
+const ttFlag   = new Int8Array(TT_SIZE);    // 0=empty, 1=EXACT, 2=LOWER, 3=UPPER
+const ttFrom   = new Int8Array(TT_SIZE);
+const ttTo     = new Int8Array(TT_SIZE);
+
+const TT_EXACT = 1, TT_LOWER = 2, TT_UPPER = 3;
+const MATE_THRESHOLD = 18000;
+
+let ttHits = 0;
+let ttProbes = 0;
+let ttStores = 0;
+let ttCutoffs = 0;
+
+function ttClear() {
+    ttFlag.fill(0);
+    ttHits = 0;
+    ttProbes = 0;
+    ttStores = 0;
+    ttCutoffs = 0;
+}
+
+function adjustStoreScore(score, ply) {
+    if (score > MATE_THRESHOLD) return score + ply;
+    if (score < -MATE_THRESHOLD) return score - ply;
+    return score;
+}
+function adjustProbeScore(score, ply) {
+    if (score > MATE_THRESHOLD) return score - ply;
+    if (score < -MATE_THRESHOLD) return score + ply;
+    return score;
+}
+
+// Returns null on miss, otherwise { score: number|null, move: {from,to}|null }.
+// score is null when the entry is too shallow to be used as a value, but a
+// move is still available for ordering.
+function ttProbe(lo, hi, depth, alpha, beta, ply) {
+    const idx = hi & TT_MASK;
+    if (ttFlag[idx] === 0) return null;
+    if (ttKeys[idx] !== hi || ttVerify[idx] !== lo) return null;
+
+    const entryDepth = ttDepth[idx];
+    const entryScore = adjustProbeScore(ttScore[idx], ply);
+    const entryFlag = ttFlag[idx];
+    const entryMove = (ttFrom[idx] >= 0) ? { from: ttFrom[idx], to: ttTo[idx] } : null;
+
+    if (entryDepth >= depth) {
+        if (entryFlag === TT_EXACT) return { score: entryScore, move: entryMove };
+        if (entryFlag === TT_LOWER && entryScore >= beta) return { score: entryScore, move: entryMove };
+        if (entryFlag === TT_UPPER && entryScore <= alpha) return { score: entryScore, move: entryMove };
+    }
+    if (entryMove) return { score: null, move: entryMove };
+    return null;
+}
+
+function ttStore(lo, hi, depth, score, flag, move) {
+    const idx = hi & TT_MASK;
+    const existingFlag = ttFlag[idx];
+    const existingDepth = ttDepth[idx];
+    // Don't overwrite a deeper exact entry with a shallower one from a different position.
+    if (existingFlag !== 0 && existingDepth > depth) {
+        if (ttKeys[idx] === hi && ttVerify[idx] === lo) {
+            // same position, only update if we have a better/deeper value
+            if (existingDepth > depth) return;
+        } else {
+            return;
+        }
+    }
+    ttKeys[idx] = hi;
+    ttVerify[idx] = lo;
+    ttDepth[idx] = depth;
+    ttFlag[idx] = flag;
+    ttScore[idx] = score;
+    if (move) {
+        ttFrom[idx] = move.from;
+        ttTo[idx] = move.to;
+    } else {
+        ttFrom[idx] = -1;
+        ttTo[idx] = -1;
+    }
+    ttStores++;
+}
 
 // ============================================================
 // GLOBAL STATE
@@ -1101,6 +1257,27 @@ function quiescenceSearch(b, alpha, beta, player, qDepth) {
 function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
     if (checkTimeOut()) return 0;
 
+    const originalAlpha = alpha;
+    let hashLo = 0, hashHi = 0;
+    let ttHitMove = null;
+
+    // TT probe (skip at root ply 0 to avoid cross-iteration weirdness)
+    if (USE_TT && ply > 0) {
+        const h = computeHash(b, player);
+        hashLo = h.lo;
+        hashHi = h.hi;
+        ttProbes++;
+        const hit = ttProbe(hashLo, hashHi, depth, alpha, beta, ply);
+        if (hit) {
+            if (hit.score !== null) {
+                ttHits++;
+                if (hit.score <= alpha || hit.score >= beta) ttCutoffs++;
+                return hit.score;
+            }
+            if (hit.move) ttHitMove = hit.move;
+        }
+    }
+
     const posKey = boardToHash(b) + player[0];
     if (ply > 0 && searchLinePositions.includes(posKey)) {
         return avoidRepetition ? (rootEvalWhite > 0 ? -REPETITION_PENALTY : REPETITION_PENALTY) : 0;
@@ -1146,12 +1323,21 @@ function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
     }
 
     const killers = (ply < MAX_PLY) ? killerMoves[ply] : null;
-    moves.sort((a, b1) => orderScore(b, b1, killers) - orderScore(b, a, killers));
+    moves.sort((a, b1) => {
+        if (ttHitMove) {
+            const aIsTT = a.from === ttHitMove.from && a.to === ttHitMove.to;
+            const bIsTT = b1.from === ttHitMove.from && b1.to === ttHitMove.to;
+            if (aIsTT && !bIsTT) return -1;
+            if (bIsTT && !aIsTT) return 1;
+        }
+        return orderScore(b, b1, killers) - orderScore(b, a, killers);
+    });
 
     const isMax = (player === 'white');
     const standPat = evaluatePositionForSearch(b, player, moveCount);
     let best = isFinite(standPat) ? standPat : 0;
     let anyMoveSearched = false;
+    let bestMoveInLoop = null;
 
     for (let i = 0; i < moves.length; i++) {
         if (searchAborted) break;
@@ -1191,14 +1377,14 @@ function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
         if (!isFinite(score)) continue;
 
         if (isMax) {
-            if (score > best) best = score;
+            if (score > best) { best = score; bestMoveInLoop = move; }
             if (best > alpha) alpha = best;
             if (alpha >= beta) {
                 if (isQuiet) storeKiller(ply, move);
                 break;
             }
         } else {
-            if (score < best) best = score;
+            if (score < best) { best = score; bestMoveInLoop = move; }
             if (best < beta) beta = best;
             if (beta <= alpha) {
                 if (isQuiet) storeKiller(ply, move);
@@ -1208,8 +1394,20 @@ function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
     }
 
     searchLinePositions.pop();
+
     if (!anyMoveSearched) return standPat;
-    return isFinite(best) ? best : 0;
+    const finalBest = isFinite(best) ? best : 0;
+
+    // TT store
+    if (USE_TT && ply > 0 && anyMoveSearched) {
+        let flag;
+        if (finalBest <= originalAlpha) flag = TT_UPPER;
+        else if (finalBest >= beta) flag = TT_LOWER;
+        else flag = TT_EXACT;
+        ttStore(hashLo, hashHi, depth, adjustStoreScore(finalBest, ply), flag, bestMoveInLoop);
+    }
+
+    return finalBest;
 }
 
 // ============================================================
@@ -1218,7 +1416,6 @@ function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
 function findBestMove() {
     searchStartTime = performance.now();
 
-    // v2.7.0: budget derived from clock when a clock is active.
     let budgetMs = 8000;
     if (clockState.enabled) {
         const remaining = getRemainingMs(currentPlayer);
@@ -1233,6 +1430,7 @@ function findBestMove() {
     nodesSearched = 0;
     searchLinePositions = [];
     resetKillerMoves();
+    if (USE_TT) ttClear();
 
     rootEvalWhite = evaluatePositionForSearch(board, currentPlayer, moveCount);
     avoidRepetition = Math.abs(rootEvalWhite) > 150;
@@ -1317,7 +1515,7 @@ function findBestMove() {
     let stableCount = 0;
     let extended = false;
 
-    console.log(`🔍 ${currentPlayer.toUpperCase()} searching depth ${baseMaxDepth} (ext to ${absoluteMaxDepth}) budget ${budgetMs.toFixed(0)}ms`);
+    console.log(`🔍 ${currentPlayer.toUpperCase()} searching depth ${baseMaxDepth} (ext to ${absoluteMaxDepth}) budget ${budgetMs.toFixed(0)}ms${USE_TT ? ' [TT]' : ''}`);
 
     for (let depth = 1; depth <= absoluteMaxDepth; depth++) {
         if (searchAborted && depth > 1) break;
@@ -1400,7 +1598,10 @@ function findBestMove() {
     }
 
     const elapsed = (performance.now() - searchStartTime).toFixed(0);
-    console.log(`⏱️ ${elapsed}ms | ${toSAN(board, bestMove, currentPlayer)} | eval ${bestEval.toFixed(1)} | depth ${lastDepth}${extended ? ' (extended)' : ''} | ${nodesSearched} nodes`);
+    const ttInfo = USE_TT
+        ? ` | TT ${ttHits}/${ttProbes} hits (${(100 * ttHits / Math.max(1, ttProbes)).toFixed(1)}%), ${ttCutoffs} cutoffs, ${ttStores} stores`
+        : '';
+    console.log(`⏱️ ${elapsed}ms | ${toSAN(board, bestMove, currentPlayer)} | eval ${bestEval.toFixed(1)} | depth ${lastDepth}${extended ? ' (extended)' : ''} | ${nodesSearched} nodes${ttInfo}`);
 
     return bestMove;
 }
@@ -1506,8 +1707,6 @@ function showPossibleMoves(row, col) {
 // MOVE PLAYING
 // ============================================================
 function playMove(fromRow, fromCol, toRow, toCol) {
-    // Flag check before playing: if the mover's clock is already spent,
-    // the game ends and the move is not made.
     if (clockState.enabled && !gameOver && getRemainingMs(currentPlayer) <= 0) {
         gameOver = true;
         const winner = currentPlayer === 'white' ? 'Black' : 'White';
@@ -1545,7 +1744,6 @@ function playMove(fromRow, fromCol, toRow, toCol) {
 
     makeMoveOnBoard(board, chosen);
 
-    // Commit the mover's clock and apply their increment.
     const mover = currentPlayer;
     commitClock();
     applyIncrement(mover);
@@ -1557,7 +1755,6 @@ function playMove(fromRow, fromCol, toRow, toCol) {
     if (currentPlayer === 'black') moveCount++;
     currentPlayer = enemyColor(currentPlayer);
 
-    // Start the opponent's clock.
     startClockFor(currentPlayer);
 
     const resultKey = boardToHash(board) + currentPlayer[0];
@@ -1640,7 +1837,6 @@ function makeAIMove() {
     if (thinking) thinking.style.display = 'block';
     if (sync) sync.textContent = `AI (${aiPlayer}) thinking...`;
 
-    // Force a display update so the AI's clock is shown at "search start"
     updateClockDisplay();
 
     setTimeout(() => {
@@ -1689,10 +1885,10 @@ function newGame() {
                        blackKingside: true, blackQueenside: true };
     enPassantTarget = null;
     evalCache.clear();
+    if (USE_TT) ttClear();
     gamePositionCounts = new Map();
     gamePositionCounts.set(boardToHash(board) + 'w', 1);
 
-    // Reset and start the clock for the new game.
     initClock(currentTimeControl);
     startClockFor('white');
     startClockTicker();
@@ -1731,7 +1927,6 @@ function undoMove() {
     uciHistory.pop();
     gameOver = false;
 
-    // Restart clock for the (now) current player.
     startClockFor(currentPlayer);
 
     createBoard();
@@ -1773,7 +1968,6 @@ function changeTimeControl() {
         console.log(`   Unlimited`);
     }
 
-    // Apply immediately. If a game is in progress, this resets the clocks.
     initClock(newControl);
     if (!gameOver) {
         startClockFor(currentPlayer);
@@ -1784,6 +1978,7 @@ function changeTimeControl() {
 function clearMemory() {
     if (confirm('Clear AI memory?')) {
         evalCache.clear();
+        if (USE_TT) ttClear();
         alert('AI memory cleared!');
     }
 }
@@ -1807,7 +2002,6 @@ window.addEventListener('load', function() {
 
     gamePositionCounts.set(boardToHash(board) + 'w', 1);
 
-    // Read the initial time control from the select.
     const tcSel = document.getElementById('timeControl');
     currentTimeControl = tcSel ? tcSel.value : 'unlimited';
 
@@ -1821,6 +2015,7 @@ window.addEventListener('load', function() {
     changeGameMode();
 
     console.log(`♔ Chess Game v${GAME_VERSION} Loaded! ♛`);
+    console.log(`⚙️ TT: ${USE_TT ? 'ON' : 'OFF'} (${(1 << TT_BITS).toLocaleString()} entries)`);
 });
 
 if (typeof window !== 'undefined') {
@@ -1832,4 +2027,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - working clock`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - Zobrist + TT`);
