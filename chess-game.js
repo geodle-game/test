@@ -1,18 +1,12 @@
 // chess-game.js
-// VERSION: 2.7.3 - Fix rook-file eval scope bug (ReferenceError: file)
+// VERSION: 2.7.4 - Endgame promotion urgency + passed-pawn bonus + king-driving
 // COMPATIBLE WITH: chess-ai-database.js (v2.0), index.html, chess-game-database.js (v1.1)
 
-const GAME_VERSION = "2.7.3";
+const GAME_VERSION = "2.7.4";
 
-// ============================================================
-// KILL SWITCHES
-// ============================================================
 const USE_TT = true;
 const TT_BITS = 18;
 
-// ============================================================
-// PIECE CODES
-// ============================================================
 const EMPTY = 0;
 const WP = 1, WN = 2, WB = 3, WR = 4, WQ = 5, WK = 6;
 const BP = 7, BN = 8, BB = 9, BR = 10, BQ = 11, BK = 12;
@@ -29,9 +23,6 @@ function isPlayerPieceCode(p, player) {
 }
 function enemyColor(c) { return c === 'white' ? 'black' : 'white'; }
 
-// ============================================================
-// SQUARE HELPERS
-// ============================================================
 const SQ_FILES = ['a','b','c','d','e','f','g','h'];
 function sqName(sq) { return SQ_FILES[sq & 7] + (8 - (sq >> 3)); }
 function sqFromRC(row, col) { return row * 8 + col; }
@@ -39,9 +30,6 @@ function sqRow(sq) { return sq >> 3; }
 function sqCol(sq) { return sq & 7; }
 function isInBounds(row, col) { return row >= 0 && row < 8 && col >= 0 && col < 8; }
 
-// ============================================================
-// PRECOMPUTED ATTACK TABLES
-// ============================================================
 const KNIGHT_ATTACKS = new Int8Array(64 * 8);
 const KING_ATTACKS = new Int8Array(64 * 8);
 const KNIGHT_DEGREE = new Int8Array(64);
@@ -76,9 +64,6 @@ const KING_DEGREE = new Int8Array(64);
     }
 })();
 
-// ============================================================
-// ZOBRIST HASH TABLES
-// ============================================================
 const ZOBRIST_PIECE_LO = [];
 const ZOBRIST_PIECE_HI = [];
 const ZOBRIST_SIDE_LO = (Math.random() * 0x100000000) | 0;
@@ -134,9 +119,6 @@ function computeHash(b, player) {
     return { lo: lo | 0, hi: hi | 0 };
 }
 
-// ============================================================
-// TRANSPOSITION TABLE
-// ============================================================
 const TT_SIZE = 1 << TT_BITS;
 const TT_MASK = TT_SIZE - 1;
 const ttKeys   = new Int32Array(TT_SIZE);
@@ -219,9 +201,6 @@ function ttStore(lo, hi, depth, score, flag, move) {
     ttStores++;
 }
 
-// ============================================================
-// GLOBAL STATE
-// ============================================================
 let board = new Int8Array(64);
 let kingSq = { white: 60, black: 4 };
 let currentPlayer = 'white';
@@ -250,9 +229,6 @@ let moveTree = null;
 
 let gamePositionCounts = new Map();
 
-// ============================================================
-// CLOCK
-// ============================================================
 const clockState = {
     enabled: false,
     whiteMs: 0,
@@ -381,9 +357,6 @@ function startClockTicker() {
     }, 100);
 }
 
-// ============================================================
-// BOARD INIT
-// ============================================================
 function resetBoardToStart() {
     board.fill(0);
     const back = [WR, WN, WB, WQ, WK, WB, WN, WR];
@@ -425,9 +398,6 @@ function displayArrayToBoard(display) {
 
 resetBoardToStart();
 
-// ============================================================
-// ATTACK DETECTION
-// ============================================================
 function isSquareAttackedBy(b, sq, byColor) {
     const r = sq >> 3, c = sq & 7;
 
@@ -499,9 +469,6 @@ function isKingInCheckForPosition(b, player) {
     return isSquareAttackedBy(b, k, enemyColor(player));
 }
 
-// ============================================================
-// MAKE / UNMAKE
-// ============================================================
 function makeMoveOnBoard(b, move) {
     const from = move.from, to = move.to;
     const piece = b[from];
@@ -606,9 +573,6 @@ function unmakeMoveOnBoard(b, move) {
     halfMoveCount = undo.halfMoveCount;
 }
 
-// ============================================================
-// MOVE GENERATION
-// ============================================================
 function generatePseudoMoves(b, player) {
     const moves = [];
     const isWhite = player === 'white';
@@ -748,9 +712,6 @@ function getAllPossibleMovesForPosition(b, player) {
     return legal;
 }
 
-// ============================================================
-// UI HELPERS
-// ============================================================
 function isValidMove(fromRow, fromCol, toRow, toCol) {
     if (toRow < 0 || toRow > 7 || toCol < 0 || toCol > 7) return false;
     const from = sqFromRC(fromRow, fromCol);
@@ -776,9 +737,6 @@ function isPlayerPiece(piece, player) {
     return false;
 }
 
-// ============================================================
-// SAN NOTATION
-// ============================================================
 const SAN_LETTER = ['', '', 'N', 'B', 'R', 'Q', 'K', '', 'N', 'B', 'R', 'Q', 'K'];
 
 function toSAN(b, move, player) {
@@ -838,9 +796,6 @@ function checkSuffix(b, move, player) {
     return suffix;
 }
 
-// ============================================================
-// EVAL
-// ============================================================
 const evalCache = new Map();
 const CACHE_LIMIT = 500000;
 
@@ -967,6 +922,30 @@ function pawnStormDanger(b, kSq, attackerIsWhite) {
     return danger;
 }
 
+// v2.7.4: Is this pawn passed? No enemy pawn on the same or adjacent files
+// ahead of it toward the promotion rank.
+function isPassedPawn(b, sq, isWhite) {
+    const r = sq >> 3, c = sq & 7;
+    const enemyPawn = isWhite ? BP : WP;
+    for (let df = -1; df <= 1; df++) {
+        const f = c + df;
+        if (f < 0 || f > 7) continue;
+        if (isWhite) {
+            // White pawns advance toward rank 0 (row decreasing).
+            // Enemy pawns "ahead" are on rows < r on the same/adjacent file.
+            for (let rr = 0; rr < r; rr++) {
+                if (b[sqFromRC(rr, f)] === enemyPawn) return false;
+            }
+        } else {
+            // Black pawns advance toward rank 7 (row increasing).
+            for (let rr = r + 1; rr < 8; rr++) {
+                if (b[sqFromRC(rr, f)] === enemyPawn) return false;
+            }
+        }
+    }
+    return true;
+}
+
 function evaluatePositionForSearch(b, player, moveNumber) {
     if (!b) return 0;
     const key = boardToHash(b) + "|" + moveNumber;
@@ -974,6 +953,7 @@ function evaluatePositionForSearch(b, player, moveNumber) {
     if (cached !== undefined) return cached;
 
     let score = 0;
+    let materialDiff = 0;
     let pieceCount = 0;
     let wNonPawnMaterial = 0;
     let bNonPawnMaterial = 0;
@@ -998,8 +978,8 @@ function evaluatePositionForSearch(b, player, moveNumber) {
         const p = b[sq];
         if (p === 0) continue;
         const v = PIECE_VALUE_ARR[p];
-        if (isWhitePiece(p)) score += v;
-        else score -= v;
+        if (isWhitePiece(p)) { score += v; materialDiff += v; }
+        else { score -= v; materialDiff -= v; }
         if (pieceType(p) !== 6) pieceCount++;
 
         const pt = pieceType(p);
@@ -1023,7 +1003,6 @@ function evaluatePositionForSearch(b, player, moveNumber) {
 
         const isWhite = isWhitePiece(p);
 
-        // Pawn structure terms
         if (pt === 1) {
             const pawn = p;
             // Doubled pawn
@@ -1057,7 +1036,7 @@ function evaluatePositionForSearch(b, player, moveNumber) {
             if (isKnightOutpost(b, sq, isWhite)) score += isWhite ? 30 : -30;
         }
 
-        // Rook file openness (v2.7.3 fix: use `c`, not an out-of-scope `file`)
+        // Rook file openness
         if (pt === 4) {
             const ownPawn = isWhite ? WP : BP;
             const enemyPawn = isWhite ? BP : WP;
@@ -1170,24 +1149,54 @@ function evaluatePositionForSearch(b, player, moveNumber) {
     score -= wKingDanger * 0.5;
     score += bKingDanger * 0.5;
 
+    // ============================================================
+    // PAWN PROMOTION (v2.7.4 - much higher values)
+    // A pawn one square from promotion is worth close to a queen,
+    // because next move it becomes one and the opponent can't stop it.
+    // ============================================================
     for (let sq = 0; sq < 64; sq++) {
         const p = b[sq];
         if (p === WP) {
             const r = sq >> 3;
-            if (r === 1) score += 400;
-            else if (r === 2) score += 200;
-            else if (r === 3) score += 80;
+            if (r === 1) {
+                score += 900;
+                if (isPassedPawn(b, sq, true)) score += 400;
+            } else if (r === 2) {
+                score += 400;
+                if (isPassedPawn(b, sq, true)) score += 150;
+            } else if (r === 3) {
+                score += 120;
+            }
         } else if (p === BP) {
             const r = sq >> 3;
-            if (r === 6) score -= 400;
-            else if (r === 5) score -= 200;
-            else if (r === 4) score -= 80;
+            if (r === 6) {
+                score -= 900;
+                if (isPassedPawn(b, sq, false)) score -= 400;
+            } else if (r === 5) {
+                score -= 400;
+                if (isPassedPawn(b, sq, false)) score -= 150;
+            } else if (r === 4) {
+                score -= 120;
+            }
         }
     }
 
     if (pieceCount <= 10) {
         score += ((7 - (wKing >> 3)) + (wKing & 7)) * 3;
         score -= ((bKing >> 3) + (7 - (bKing & 7))) * 3;
+
+        // ============================================================
+        // v2.7.4: Drive enemy king to edge when decisively winning.
+        // In K+R vs K, K+Q vs K, etc., the fastest mate involves
+        // pushing the enemy king to the rim. This rewards that plan.
+        // ============================================================
+        const wEdgeDist = Math.min(wKingRow, 7 - wKingRow, wKingCol, 7 - wKingCol);
+        const bEdgeDist = Math.min(bKingRow, 7 - bKingRow, bKingCol, 7 - bKingCol);
+        if (materialDiff > 300) {
+            score += (3 - bEdgeDist) * 30;
+        } else if (materialDiff < -300) {
+            score -= (3 - wEdgeDist) * 30;
+        }
     }
 
     cacheSet(evalCache, key, score);
@@ -1215,9 +1224,6 @@ function hasNonPawnMaterial(b, player) {
     return false;
 }
 
-// ============================================================
-// SEARCH
-// ============================================================
 const SEARCH_CONFIG = {
     baseDepth: 4,
     endgameDepth: 6,
@@ -1491,9 +1497,6 @@ function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
     return finalBest;
 }
 
-// ============================================================
-// SEARCH ENTRY
-// ============================================================
 function findBestMove() {
     searchStartTime = performance.now();
 
@@ -1687,9 +1690,6 @@ function findBestMove() {
     return bestMove;
 }
 
-// ============================================================
-// UI RENDERING
-// ============================================================
 function createBoard() {
     const boardElement = document.getElementById('chessboard');
     if (!boardElement) return;
@@ -1784,9 +1784,6 @@ function showPossibleMoves(row, col) {
     }
 }
 
-// ============================================================
-// MOVE PLAYING
-// ============================================================
 function playMove(fromRow, fromCol, toRow, toCol) {
     if (clockState.enabled && !gameOver && getRemainingMs(currentPlayer) <= 0) {
         gameOver = true;
@@ -1933,9 +1930,6 @@ function makeAIMove() {
     }, 50);
 }
 
-// ============================================================
-// PARSE ALGEBRAIC MOVE
-// ============================================================
 function parseAlgebraicMove(str) {
     if (!str || str.length < 4) return null;
     const fromCol = str.charCodeAt(0) - 97;
@@ -1947,9 +1941,6 @@ function parseAlgebraicMove(str) {
     return { fromRow, fromCol, toRow, toCol };
 }
 
-// ============================================================
-// UI BUTTONS
-// ============================================================
 function newGame() {
     resetBoardToStart();
     currentPlayer = 'white';
@@ -2064,9 +2055,6 @@ function clearMemory() {
     }
 }
 
-// ============================================================
-// INIT
-// ============================================================
 window.addEventListener('load', function() {
     if (typeof ChessAILearner !== 'undefined') {
         enhancedAI = new ChessAILearner();
@@ -2108,4 +2096,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - rook-file eval fix`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - endgame promotion urgency`);
