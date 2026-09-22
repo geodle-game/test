@@ -1,14 +1,14 @@
 // chess-game.js
-// VERSION: 2.7.1 - Zobrist hashing + per-search transposition table (kill switch: USE_TT)
+// VERSION: 2.7.2 - Strategic eval terms + lower base depth
 // COMPATIBLE WITH: chess-ai-database.js (v2.0), index.html, chess-game-database.js (v1.1)
 
-const GAME_VERSION = "2.7.1";
+const GAME_VERSION = "2.7.2";
 
 // ============================================================
 // KILL SWITCHES
 // ============================================================
-const USE_TT = true;          // transposition table (Zobrist-keyed, per-search)
-const TT_BITS = 18;           // 2^18 = 262144 entries (~4MB)
+const USE_TT = true;
+const TT_BITS = 18;
 
 // ============================================================
 // PIECE CODES
@@ -109,8 +109,6 @@ const ZOBRIST_EP_HI = [];
     }
 })();
 
-// Compute a 64-bit Zobrist hash (returned as two 32-bit halves) for a position.
-// Includes pieces, side to move, castling rights, and en passant.
 function computeHash(b, player) {
     let lo = 0, hi = 0;
     for (let sq = 0; sq < 64; sq++) {
@@ -141,11 +139,11 @@ function computeHash(b, player) {
 // ============================================================
 const TT_SIZE = 1 << TT_BITS;
 const TT_MASK = TT_SIZE - 1;
-const ttKeys   = new Int32Array(TT_SIZE);   // 32-bit key (hi)
-const ttVerify = new Int32Array(TT_SIZE);   // 32-bit verify (lo)
+const ttKeys   = new Int32Array(TT_SIZE);
+const ttVerify = new Int32Array(TT_SIZE);
 const ttScore  = new Int32Array(TT_SIZE);
 const ttDepth  = new Int8Array(TT_SIZE);
-const ttFlag   = new Int8Array(TT_SIZE);    // 0=empty, 1=EXACT, 2=LOWER, 3=UPPER
+const ttFlag   = new Int8Array(TT_SIZE);
 const ttFrom   = new Int8Array(TT_SIZE);
 const ttTo     = new Int8Array(TT_SIZE);
 
@@ -176,9 +174,6 @@ function adjustProbeScore(score, ply) {
     return score;
 }
 
-// Returns null on miss, otherwise { score: number|null, move: {from,to}|null }.
-// score is null when the entry is too shallow to be used as a value, but a
-// move is still available for ordering.
 function ttProbe(lo, hi, depth, alpha, beta, ply) {
     const idx = hi & TT_MASK;
     if (ttFlag[idx] === 0) return null;
@@ -202,10 +197,8 @@ function ttStore(lo, hi, depth, score, flag, move) {
     const idx = hi & TT_MASK;
     const existingFlag = ttFlag[idx];
     const existingDepth = ttDepth[idx];
-    // Don't overwrite a deeper exact entry with a shallower one from a different position.
     if (existingFlag !== 0 && existingDepth > depth) {
         if (ttKeys[idx] === hi && ttVerify[idx] === lo) {
-            // same position, only update if we have a better/deeper value
             if (existingDepth > depth) return;
         } else {
             return;
@@ -928,6 +921,59 @@ function countShieldPawns(b, kSq, isWhite) {
     return count;
 }
 
+// v2.7.2: knight outpost (strict — no enemy pawn on adjacent files can ever attack).
+function isKnightOutpost(b, sq, isWhite) {
+    const r = sq >> 3, c = sq & 7;
+    if (r < 2 || r > 5) return false;
+    // Must be defended by a friendly pawn.
+    let defended = false;
+    if (isWhite) {
+        if (c > 0 && r < 7 && b[sqFromRC(r+1, c-1)] === WP) defended = true;
+        if (c < 7 && r < 7 && b[sqFromRC(r+1, c+1)] === WP) defended = true;
+    } else {
+        if (c > 0 && r > 0 && b[sqFromRC(r-1, c-1)] === BP) defended = true;
+        if (c < 7 && r > 0 && b[sqFromRC(r-1, c+1)] === BP) defended = true;
+    }
+    if (!defended) return false;
+    const enemyPawn = isWhite ? BP : WP;
+    for (const df of [-1, 1]) {
+        const f = c + df;
+        if (f < 0 || f > 7) continue;
+        if (isWhite) {
+            // White knight: black pawns attack downward. No black pawn may exist on
+            // file f at any row < r (from which it could advance to r-1 and attack r).
+            for (let pr = 0; pr < r; pr++) {
+                if (b[sqFromRC(pr, f)] === enemyPawn) return false;
+            }
+        } else {
+            // Black knight: white pawns attack upward. No white pawn may exist on
+            // file f at any row > r.
+            for (let pr = r + 1; pr < 8; pr++) {
+                if (b[sqFromRC(pr, f)] === enemyPawn) return false;
+            }
+        }
+    }
+    return true;
+}
+
+// v2.7.2: pawn storm danger — enemy pawns advancing toward our king.
+function pawnStormDanger(b, kSq, attackerIsWhite) {
+    const kFile = kSq & 7;
+    const attackerPawn = attackerIsWhite ? WP : BP;
+    let danger = 0;
+    for (let sq = 0; sq < 64; sq++) {
+        if (b[sq] !== attackerPawn) continue;
+        const r = sq >> 3, c = sq & 7;
+        const fileDist = Math.abs(c - kFile);
+        if (fileDist > 3) continue;
+        const advance = attackerIsWhite ? (6 - r) : (r - 1);
+        if (advance <= 0) continue;
+        const fileWeight = Math.max(1, 4 - fileDist);
+        danger += advance * fileWeight * 15;
+    }
+    return danger;
+}
+
 function evaluatePositionForSearch(b, player, moveNumber) {
     if (!b) return 0;
     const key = boardToHash(b) + "|" + moveNumber;
@@ -984,11 +1030,54 @@ function evaluatePositionForSearch(b, player, moveNumber) {
 
         const isWhite = isWhitePiece(p);
 
+        // Pawn structure terms (v2.7.2)
+        if (pt === 1) {
+            const file = c;
+            const pawn = p;
+            // Doubled pawn
+            let doubled = false;
+            for (let rr = 0; rr < 8; rr++) {
+                if (rr !== r && b[sqFromRC(rr, file)] === pawn) { doubled = true; break; }
+            }
+            if (doubled) score += isWhite ? -12 : 12;
+            // Isolated pawn
+            let isolated = true;
+            for (const df of [-1, 1]) {
+                const f = file + df;
+                if (f < 0 || f > 7) continue;
+                for (let rr = 0; rr < 8; rr++) {
+                    if (b[sqFromRC(rr, f)] === pawn) { isolated = false; break; }
+                }
+                if (!isolated) break;
+            }
+            if (isolated) score += isWhite ? -15 : 15;
+        }
+
         if (pt === 2 || pt === 3) {
             const backRank = isWhite ? 7 : 0;
             if ((sq >> 3) === backRank) {
                 score += isWhite ? (pt === 2 ? -25 : -15) : (pt === 2 ? 25 : 15);
             }
+        }
+
+        // Knight outpost (v2.7.2)
+        if (pt === 2) {
+            if (isKnightOutpost(b, sq, isWhite)) score += isWhite ? 30 : -30;
+        }
+
+        // Rook file openness (v2.7.2)
+        if (pt === 4) {
+            const ownPawn = isWhite ? WP : BP;
+            const enemyPawn = isWhite ? BP : WP;
+            let hasOwn = false, hasEnemy = false;
+            for (let rr = 0; rr < 8; rr++) {
+                const pp = b[sqFromRC(rr, file)];
+                if (pp === ownPawn) hasOwn = true;
+                else if (pp === enemyPawn) hasEnemy = true;
+            }
+            // (reuse `file` from above — it's `c`)
+            if (!hasOwn && !hasEnemy) score += isWhite ? 25 : -25;
+            else if (!hasOwn) score += isWhite ? 12 : -12;
         }
 
         if (pt === 5) {
@@ -1001,7 +1090,7 @@ function evaluatePositionForSearch(b, player, moveNumber) {
         }
     }
 
-    // Bishop pair bonus
+    // Bishop pair
     if (wBishopCount >= 2) score += 25;
     if (bBishopCount >= 2) score -= 25;
 
@@ -1070,6 +1159,10 @@ function evaluatePositionForSearch(b, player, moveNumber) {
         }
     }
 
+    // Pawn storm danger (v2.7.2)
+    wKingDanger += pawnStormDanger(b, wKing, false);
+    bKingDanger += pawnStormDanger(b, bKing, true);
+
     if (isSquareAttackedBy(b, wKing, 'black')) wKingDanger += 200;
     if (isSquareAttackedBy(b, bKing, 'white')) bKingDanger += 200;
 
@@ -1136,8 +1229,8 @@ function hasNonPawnMaterial(b, player) {
 // SEARCH
 // ============================================================
 const SEARCH_CONFIG = {
-    baseDepth: 5,
-    endgameDepth: 7,
+    baseDepth: 4,          // v2.7.2: lowered from 5 (extension compensates)
+    endgameDepth: 6,       // v2.7.2: lowered from 7
     quiescenceDepth: 3,
     hardMaxDepth: 8
 };
@@ -1261,7 +1354,6 @@ function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
     let hashLo = 0, hashHi = 0;
     let ttHitMove = null;
 
-    // TT probe (skip at root ply 0 to avoid cross-iteration weirdness)
     if (USE_TT && ply > 0) {
         const h = computeHash(b, player);
         hashLo = h.lo;
@@ -1398,7 +1490,6 @@ function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
     if (!anyMoveSearched) return standPat;
     const finalBest = isFinite(best) ? best : 0;
 
-    // TT store
     if (USE_TT && ply > 0 && anyMoveSearched) {
         let flag;
         if (finalBest <= originalAlpha) flag = TT_UPPER;
@@ -1853,7 +1944,7 @@ function makeAIMove() {
 }
 
 // ============================================================
-// PARSE ALGEBRAIC MOVE (book format)
+// PARSE ALGEBRAIC MOVE
 // ============================================================
 function parseAlgebraicMove(str) {
     if (!str || str.length < 4) return null;
@@ -2027,4 +2118,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - Zobrist + TT`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - strategic eval terms`);
