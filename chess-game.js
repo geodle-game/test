@@ -1,8 +1,8 @@
 // chess-game.js
-// VERSION: 2.7.5 - Fixed endgame: capped pawn-advancement bonuses, K+P vs K technique, promotion ordering
+// VERSION: 2.7.6 - Fixed horizon-effect blunder (deeper base, stricter convergence)
 // COMPATIBLE WITH: chess-ai-database.js (v2.0), index.html, chess-game-database.js (v1.1)
 
-const GAME_VERSION = "2.7.5";
+const GAME_VERSION = "2.7.6";
 
 const USE_TT = true;
 const TT_BITS = 18;
@@ -931,13 +931,10 @@ function isPassedPawn(b, sq, isWhite) {
         const f = c + df;
         if (f < 0 || f > 7) continue;
         if (isWhite) {
-            // White pawns advance toward rank 0 (row decreasing).
-            // Enemy pawns "ahead" are on rows < r on the same/adjacent file.
             for (let rr = 0; rr < r; rr++) {
                 if (b[sqFromRC(rr, f)] === enemyPawn) return false;
             }
         } else {
-            // Black pawns advance toward rank 7 (row increasing).
             for (let rr = r + 1; rr < 8; rr++) {
                 if (b[sqFromRC(rr, f)] === enemyPawn) return false;
             }
@@ -1195,11 +1192,8 @@ function evaluatePositionForSearch(b, player, moveNumber) {
             const pr = sq >> 3, pc = sq & 7;
 
             if (p === WP) {
-                // White king in front of the pawn (winning shape)
                 if (wKingRow < pr && Math.abs(wKingCol - pc) <= 1) score += 120;
-                // White king on promotion rank blocking its own corner pawn (draw)
                 if (wKingRow === 0 && wKingCol === pc && (pc === 0 || pc === 7)) score -= 250;
-                // More general: king directly in front of a 7th-rank pawn
                 if (pr === 1 && wKingRow === 0 && Math.abs(wKingCol - pc) <= 1) score -= 80;
             } else {
                 if (bKingRow > pr && Math.abs(bKingCol - pc) <= 1) score -= 120;
@@ -1216,15 +1210,13 @@ function evaluatePositionForSearch(b, player, moveNumber) {
         // ============================================================
         // v2.7.5: Only "drive the enemy king to the edge" when we have
         // an actual mating force on the board (R/Q or 2+ minors ahead).
-        // Otherwise in K+P vs K we want to escort the pawn, not
-        // chase the king — and definitely not sac the pawn to do it.
         // ============================================================
         const wEdgeDist = Math.min(wKingRow, 7 - wKingRow, wKingCol, 7 - wKingCol);
         const bEdgeDist = Math.min(bKingRow, 7 - bKingRow, bKingCol, 7 - bKingCol);
 
         const wHeavy = wNonPawnMaterial - bNonPawnMaterial;
         const bHeavy = bNonPawnMaterial - wNonPawnMaterial;
-        const hasMatingForce_White = wHeavy >= 500;   // at least a rook up in non-pawns
+        const hasMatingForce_White = wHeavy >= 500;
         const hasMatingForce_Black = bHeavy >= 500;
 
         if (materialDiff > 300 && hasMatingForce_White) {
@@ -1259,15 +1251,20 @@ function hasNonPawnMaterial(b, player) {
     return false;
 }
 
+// ============================================================
+// v2.7.6: Deeper base depth so 4-ply-deep tactical traps are
+// visible before the extension loop bails out. Stricter
+// convergence (2 stable iterations) prevents premature stop.
+// ============================================================
 const SEARCH_CONFIG = {
-    baseDepth: 4,
-    endgameDepth: 6,
+    baseDepth: 5,
+    endgameDepth: 7,
     quiescenceDepth: 3,
-    hardMaxDepth: 8
+    hardMaxDepth: 9
 };
 
 const EXTENSION_SCORE_THRESHOLD = 25;
-const EXTENSION_STABLE_LIMIT = 1;
+const EXTENSION_STABLE_LIMIT = 2;
 let extensionSoftDeadline = 0;
 
 let searchStartTime = 0;
@@ -1617,8 +1614,6 @@ function findBestMove() {
 
     // ============================================================
     // v2.7.5: Promotion-first move ordering at the root.
-    // This ensures a queen-promotion is always examined before
-    // the search can prune to a shallow depth and miss it.
     // ============================================================
     candidateMoves.sort((a, b1) => {
         const aQueen = a.promo === 5 ? 1 : 0;
@@ -1706,7 +1701,7 @@ function findBestMove() {
                 if (delta < EXTENSION_SCORE_THRESHOLD && !moveChanged) {
                     stableCount++;
                     if (stableCount >= EXTENSION_STABLE_LIMIT) {
-                        console.log(`   ✅ Converged at depth ${depth} (delta ${delta.toFixed(1)}, same move)`);
+                        console.log(`   ✅ Converged at depth ${depth} (delta ${delta.toFixed(1)}, same move, stableCount ${stableCount})`);
                         break;
                     }
                 } else {
@@ -2139,4 +2134,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - endgame promotion urgency`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - deeper base, stricter convergence`);
