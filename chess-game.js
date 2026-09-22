@@ -1,8 +1,8 @@
 // chess-game.js
-// VERSION: 2.6.8 - Pawn-shield condition on king safety, extension on instability
+// VERSION: 2.7.0 - Working clock (Fischer increment), AI time budget tied to clock
 // COMPATIBLE WITH: chess-ai-database.js (v2.0), index.html, chess-game-database.js (v1.1)
 
-const GAME_VERSION = "2.6.8";
+const GAME_VERSION = "2.7.0";
 
 // ============================================================
 // PIECE CODES
@@ -100,6 +100,137 @@ let openingBook = null;
 let moveTree = null;
 
 let gamePositionCounts = new Map();
+
+// ============================================================
+// CLOCK
+// ============================================================
+const clockState = {
+    enabled: false,
+    whiteMs: 0,
+    blackMs: 0,
+    incrementMs: 0,
+    activeAt: 0,
+    activePlayer: null
+};
+
+let clockDisplayInterval = null;
+let currentTimeControl = 'unlimited';
+
+function parseTimeControl(str) {
+    if (!str || str === 'unlimited') return null;
+    const m = String(str).match(/^(\d+)\+(\d+)$/);
+    if (!m) return null;
+    return {
+        baseMs: parseInt(m[1], 10) * 60 * 1000,
+        incrementMs: parseInt(m[2], 10) * 1000
+    };
+}
+
+function initClock(timeControlStr) {
+    currentTimeControl = timeControlStr;
+    const tc = parseTimeControl(timeControlStr);
+    if (!tc) {
+        clockState.enabled = false;
+        clockState.whiteMs = 0;
+        clockState.blackMs = 0;
+        clockState.incrementMs = 0;
+        clockState.activePlayer = null;
+        clockState.activeAt = 0;
+    } else {
+        clockState.enabled = true;
+        clockState.whiteMs = tc.baseMs;
+        clockState.blackMs = tc.baseMs;
+        clockState.incrementMs = tc.incrementMs;
+        clockState.activePlayer = null;
+        clockState.activeAt = performance.now();
+    }
+    updateClockDisplay();
+}
+
+function startClockFor(player) {
+    if (!clockState.enabled) return;
+    clockState.activePlayer = player;
+    clockState.activeAt = performance.now();
+}
+
+function commitClock() {
+    if (!clockState.enabled || !clockState.activePlayer) return;
+    const elapsed = performance.now() - clockState.activeAt;
+    const key = clockState.activePlayer + 'Ms';
+    clockState[key] = Math.max(0, clockState[key] - elapsed);
+    clockState.activeAt = performance.now();
+}
+
+function applyIncrement(player) {
+    if (!clockState.enabled) return;
+    clockState[player + 'Ms'] += clockState.incrementMs;
+}
+
+function getRemainingMs(player) {
+    if (!clockState.enabled) return Infinity;
+    const base = clockState[player + 'Ms'];
+    if (clockState.activePlayer === player) {
+        return Math.max(0, base - (performance.now() - clockState.activeAt));
+    }
+    return base;
+}
+
+function formatClock(ms) {
+    if (!isFinite(ms)) return '∞';
+    if (ms < 0) ms = 0;
+    if (ms < 10000) return (ms / 1000).toFixed(1);
+    const totalSec = Math.floor(ms / 1000);
+    const m = Math.floor(totalSec / 60);
+    const s = totalSec % 60;
+    return `${m}:${s.toString().padStart(2, '0')}`;
+}
+
+function updateClockDisplay() {
+    const wEl = document.getElementById('white-clock');
+    const bEl = document.getElementById('black-clock');
+    if (!wEl || !bEl) return;
+
+    if (!clockState.enabled) {
+        wEl.textContent = '∞';
+        bEl.textContent = '∞';
+        wEl.classList.remove('active', 'low');
+        bEl.classList.remove('active', 'low');
+        return;
+    }
+
+    const wMs = getRemainingMs('white');
+    const bMs = getRemainingMs('black');
+    wEl.textContent = formatClock(wMs);
+    bEl.textContent = formatClock(bMs);
+
+    wEl.classList.toggle('active', currentPlayer === 'white' && !gameOver);
+    bEl.classList.toggle('active', currentPlayer === 'black' && !gameOver);
+    wEl.classList.toggle('low', wMs < 20000);
+    bEl.classList.toggle('low', bMs < 20000);
+}
+
+function checkFlagFall() {
+    if (!clockState.enabled || gameOver) return;
+    const p = currentPlayer;
+    if (getRemainingMs(p) > 0) return;
+
+    gameOver = true;
+    const winner = p === 'white' ? 'Black' : 'White';
+    const statusEl = document.getElementById('status');
+    if (statusEl) {
+        statusEl.textContent = `${winner} wins on time!`;
+        statusEl.classList.add('checkmate');
+    }
+    updateClockDisplay();
+}
+
+function startClockTicker() {
+    if (clockDisplayInterval) clearInterval(clockDisplayInterval);
+    clockDisplayInterval = setInterval(() => {
+        updateClockDisplay();
+        checkFlagFall();
+    }, 100);
+}
 
 // ============================================================
 // BOARD INIT
@@ -350,10 +481,6 @@ function generatePseudoMoves(b, player) {
                 const to1 = sqFromRC(r1, c);
                 if (b[to1] === 0) {
                     if (r1 === promoRow) {
-                        // v2.6.7 FIX: color-neutral promo codes (2-5).
-                        // makeMoveOnBoard adds +6 for black. Previously this
-                        // added +6 here AND in makeMoveOnBoard, producing
-                        // invalid piece code 17 for black promotions.
                         for (const p of [5, 4, 3, 2]) {
                             moves.push({ from, to: to1, promo: p });
                         }
@@ -375,7 +502,6 @@ function generatePseudoMoves(b, player) {
                 const target = b[to];
                 if (target !== 0 && (isWhitePiece(target) !== isWhite)) {
                     if (nr === promoRow) {
-                        // v2.6.7 FIX: color-neutral promo codes.
                         for (const p of [5, 4, 3, 2]) {
                             moves.push({ from, to, promo: p });
                         }
@@ -630,9 +756,6 @@ function pieceMobility(b, sq, player) {
     return count;
 }
 
-// v2.6.8: count shield pawns in front of a king on its back rank.
-// Returns 0..3 — number of the three files in front of the king that
-// still hold a friendly pawn on its starting square.
 function countShieldPawns(b, kSq, isWhite) {
     const kRow = kSq >> 3;
     const kCol = kSq & 7;
@@ -659,6 +782,8 @@ function evaluatePositionForSearch(b, player, moveNumber) {
     let pieceCount = 0;
     let wNonPawnMaterial = 0;
     let bNonPawnMaterial = 0;
+    let wBishopCount = 0;
+    let bBishopCount = 0;
 
     let wUndevelopedMinors = 0;
     let bUndevelopedMinors = 0;
@@ -683,6 +808,10 @@ function evaluatePositionForSearch(b, player, moveNumber) {
         if (pieceType(p) !== 6) pieceCount++;
 
         const pt = pieceType(p);
+        if (pt === 3) {
+            if (isWhitePiece(p)) wBishopCount++;
+            else bBishopCount++;
+        }
         if (pt !== 1 && pt !== 6) {
             if (isWhitePiece(p)) wNonPawnMaterial += v;
             else bNonPawnMaterial += v;
@@ -716,6 +845,10 @@ function evaluatePositionForSearch(b, player, moveNumber) {
         }
     }
 
+    // Bishop pair bonus
+    if (wBishopCount >= 2) score += 25;
+    if (bBishopCount >= 2) score -= 25;
+
     function countConnectedRooks(b, code) {
         const rooks = [];
         for (let sq = 0; sq < 64; sq++) if (b[sq] === code) rooks.push(sq);
@@ -748,7 +881,6 @@ function evaluatePositionForSearch(b, player, moveNumber) {
     score += 20 * countConnectedRooks(b, WR);
     score -= 20 * countConnectedRooks(b, BR);
 
-    // KING SAFETY BONUS (gated on enemy non-pawn material AND intact pawn shield)
     const KING_SAFETY_THRESHOLD = 900;
     const KING_SAFETY_BONUS = 45;
 
@@ -767,7 +899,6 @@ function evaluatePositionForSearch(b, player, moveNumber) {
         }
     }
 
-    // KING DANGER
     let wKingDanger = 0, bKingDanger = 0;
     let wKingEscapes = 0, bKingEscapes = 0;
 
@@ -855,10 +986,9 @@ const SEARCH_CONFIG = {
     hardMaxDepth: 8
 };
 
-// v2.6.8 extension tuning
-const EXTENSION_SCORE_THRESHOLD = 25;   // score swing (points) that triggers extension
-const EXTENSION_SOFT_DEADLINE_MS = 6500; // leave ~1.5s of the 8s budget as buffer
-const EXTENSION_STABLE_LIMIT = 2;        // stop after this many consecutive stable depths
+const EXTENSION_SCORE_THRESHOLD = 25;
+const EXTENSION_STABLE_LIMIT = 1;
+let extensionSoftDeadline = 0;
 
 let searchStartTime = 0;
 let searchDeadline = Infinity;
@@ -1087,7 +1217,18 @@ function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
 // ============================================================
 function findBestMove() {
     searchStartTime = performance.now();
-    searchDeadline = searchStartTime + 8000;
+
+    // v2.7.0: budget derived from clock when a clock is active.
+    let budgetMs = 8000;
+    if (clockState.enabled) {
+        const remaining = getRemainingMs(currentPlayer);
+        const reserve = Math.max(500, clockState.incrementMs * 2);
+        const usable = Math.max(50, remaining - reserve);
+        budgetMs = Math.min(4000, Math.max(50, usable * 0.2));
+    }
+    searchDeadline = searchStartTime + budgetMs;
+    extensionSoftDeadline = searchStartTime + Math.max(0, budgetMs - 500);
+
     searchAborted = false;
     nodesSearched = 0;
     searchLinePositions = [];
@@ -1171,13 +1312,12 @@ function findBestMove() {
     let bestEval = currentPlayer === 'white' ? -Infinity : Infinity;
     let lastDepth = 0;
 
-    // Extension-on-instability state
     let prevScore = null;
     let prevMoveKey = null;
     let stableCount = 0;
     let extended = false;
 
-    console.log(`🔍 ${currentPlayer.toUpperCase()} searching depth ${baseMaxDepth} (ext to ${absoluteMaxDepth})`);
+    console.log(`🔍 ${currentPlayer.toUpperCase()} searching depth ${baseMaxDepth} (ext to ${absoluteMaxDepth}) budget ${budgetMs.toFixed(0)}ms`);
 
     for (let depth = 1; depth <= absoluteMaxDepth; depth++) {
         if (searchAborted && depth > 1) break;
@@ -1233,7 +1373,6 @@ function findBestMove() {
             });
         }
 
-        // Extension-on-instability logic. Only kicks in beyond the base depth.
         if (!isBaseDepth && iterBestMove) {
             const newMoveKey = bestMove.from + ',' + bestMove.to;
             if (prevScore !== null && prevMoveKey !== null) {
@@ -1249,7 +1388,7 @@ function findBestMove() {
                     stableCount = 0;
                 }
             }
-            if (performance.now() - searchStartTime > EXTENSION_SOFT_DEADLINE_MS) {
+            if (performance.now() > extensionSoftDeadline) {
                 console.log(`   ⏱️ Extension stopped at depth ${depth} (soft deadline)`);
                 break;
             }
@@ -1367,6 +1506,20 @@ function showPossibleMoves(row, col) {
 // MOVE PLAYING
 // ============================================================
 function playMove(fromRow, fromCol, toRow, toCol) {
+    // Flag check before playing: if the mover's clock is already spent,
+    // the game ends and the move is not made.
+    if (clockState.enabled && !gameOver && getRemainingMs(currentPlayer) <= 0) {
+        gameOver = true;
+        const winner = currentPlayer === 'white' ? 'Black' : 'White';
+        const statusEl = document.getElementById('status');
+        if (statusEl) {
+            statusEl.textContent = `${winner} wins on time!`;
+            statusEl.classList.add('checkmate');
+        }
+        updateClockDisplay();
+        return;
+    }
+
     const from = sqFromRC(fromRow, fromCol);
     const to = sqFromRC(toRow, toCol);
 
@@ -1392,12 +1545,20 @@ function playMove(fromRow, fromCol, toRow, toCol) {
 
     makeMoveOnBoard(board, chosen);
 
+    // Commit the mover's clock and apply their increment.
+    const mover = currentPlayer;
+    commitClock();
+    applyIncrement(mover);
+
     lastMove = { fromRow, fromCol, toRow, toCol };
     moveHistory.push(san);
     uciHistory.push(sqName(from) + sqName(to));
 
     if (currentPlayer === 'black') moveCount++;
     currentPlayer = enemyColor(currentPlayer);
+
+    // Start the opponent's clock.
+    startClockFor(currentPlayer);
 
     const resultKey = boardToHash(board) + currentPlayer[0];
     gamePositionCounts.set(resultKey, (gamePositionCounts.get(resultKey) || 0) + 1);
@@ -1479,6 +1640,9 @@ function makeAIMove() {
     if (thinking) thinking.style.display = 'block';
     if (sync) sync.textContent = `AI (${aiPlayer}) thinking...`;
 
+    // Force a display update so the AI's clock is shown at "search start"
+    updateClockDisplay();
+
     setTimeout(() => {
         const move = findBestMove();
         isThinking = false;
@@ -1528,6 +1692,11 @@ function newGame() {
     gamePositionCounts = new Map();
     gamePositionCounts.set(boardToHash(board) + 'w', 1);
 
+    // Reset and start the clock for the new game.
+    initClock(currentTimeControl);
+    startClockFor('white');
+    startClockTicker();
+
     createBoard();
     updateStatus();
     updateMoveHistory();
@@ -1562,6 +1731,9 @@ function undoMove() {
     uciHistory.pop();
     gameOver = false;
 
+    // Restart clock for the (now) current player.
+    startClockFor(currentPlayer);
+
     createBoard();
     updateStatus();
     updateMoveHistory();
@@ -1590,7 +1762,23 @@ function changeGameMode() {
 
 function changeTimeControl() {
     const sel = document.getElementById('timeControl');
-    console.log(`⏱️ Time control changed to: ${sel ? sel.value : 'unlimited'}`);
+    if (!sel) return;
+    const newControl = sel.value;
+    console.log(`⏱️ Time control changed to: ${newControl}`);
+
+    const tc = parseTimeControl(newControl);
+    if (tc) {
+        console.log(`   Base: ${tc.baseMs / 1000}s, Increment: ${tc.incrementMs / 1000}s`);
+    } else {
+        console.log(`   Unlimited`);
+    }
+
+    // Apply immediately. If a game is in progress, this resets the clocks.
+    initClock(newControl);
+    if (!gameOver) {
+        startClockFor(currentPlayer);
+        startClockTicker();
+    }
 }
 
 function clearMemory() {
@@ -1619,6 +1807,14 @@ window.addEventListener('load', function() {
 
     gamePositionCounts.set(boardToHash(board) + 'w', 1);
 
+    // Read the initial time control from the select.
+    const tcSel = document.getElementById('timeControl');
+    currentTimeControl = tcSel ? tcSel.value : 'unlimited';
+
+    initClock(currentTimeControl);
+    startClockFor('white');
+    startClockTicker();
+
     createBoard();
     updateStatus();
     updateMoveHistory();
@@ -1636,4 +1832,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - pawn-shield gate + extension on instability`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - working clock`);
