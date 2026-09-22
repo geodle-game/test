@@ -1,8 +1,8 @@
 // chess-game.js
-// VERSION: 2.6.6 - Root alpha-beta, killer moves, LMR fix, depth 5/7/8
+// VERSION: 2.6.8 - Pawn-shield condition on king safety, extension on instability
 // COMPATIBLE WITH: chess-ai-database.js (v2.0), index.html, chess-game-database.js (v1.1)
 
-const GAME_VERSION = "2.6.6";
+const GAME_VERSION = "2.6.8";
 
 // ============================================================
 // PIECE CODES
@@ -84,8 +84,8 @@ let moveCount = 1;
 
 let selectedSquare = null;
 let gameHistory = [];
-let moveHistory = [];      // SAN, for display
-let uciHistory = [];       // UCI (e.g. 'e2e4'), for opening book lookup
+let moveHistory = [];
+let uciHistory = [];
 let lastMove = null;
 let gameOver = false;
 let gameMode = 'ai';
@@ -99,7 +99,6 @@ let patternLearner = null;
 let openingBook = null;
 let moveTree = null;
 
-// Position repetition tracking across the whole game
 let gamePositionCounts = new Map();
 
 // ============================================================
@@ -351,8 +350,12 @@ function generatePseudoMoves(b, player) {
                 const to1 = sqFromRC(r1, c);
                 if (b[to1] === 0) {
                     if (r1 === promoRow) {
+                        // v2.6.7 FIX: color-neutral promo codes (2-5).
+                        // makeMoveOnBoard adds +6 for black. Previously this
+                        // added +6 here AND in makeMoveOnBoard, producing
+                        // invalid piece code 17 for black promotions.
                         for (const p of [5, 4, 3, 2]) {
-                            moves.push({ from, to: to1, promo: isWhite ? p : p + 6 });
+                            moves.push({ from, to: to1, promo: p });
                         }
                     } else {
                         moves.push({ from, to: to1, promo: 0 });
@@ -372,8 +375,9 @@ function generatePseudoMoves(b, player) {
                 const target = b[to];
                 if (target !== 0 && (isWhitePiece(target) !== isWhite)) {
                     if (nr === promoRow) {
+                        // v2.6.7 FIX: color-neutral promo codes.
                         for (const p of [5, 4, 3, 2]) {
-                            moves.push({ from, to, promo: isWhite ? p : p + 6 });
+                            moves.push({ from, to, promo: p });
                         }
                     } else {
                         moves.push({ from, to, promo: 0 });
@@ -626,6 +630,25 @@ function pieceMobility(b, sq, player) {
     return count;
 }
 
+// v2.6.8: count shield pawns in front of a king on its back rank.
+// Returns 0..3 — number of the three files in front of the king that
+// still hold a friendly pawn on its starting square.
+function countShieldPawns(b, kSq, isWhite) {
+    const kRow = kSq >> 3;
+    const kCol = kSq & 7;
+    const backRank = isWhite ? 7 : 0;
+    if (kRow !== backRank) return 0;
+    const pawnRow = isWhite ? 6 : 1;
+    const pawnCode = isWhite ? WP : BP;
+    let count = 0;
+    for (let dc = -1; dc <= 1; dc++) {
+        const c = kCol + dc;
+        if (c < 0 || c > 7) continue;
+        if (b[sqFromRC(pawnRow, c)] === pawnCode) count++;
+    }
+    return count;
+}
+
 function evaluatePositionForSearch(b, player, moveNumber) {
     if (!b) return 0;
     const key = boardToHash(b) + "|" + moveNumber;
@@ -693,7 +716,6 @@ function evaluatePositionForSearch(b, player, moveNumber) {
         }
     }
 
-    // CONNECTED ROOKS
     function countConnectedRooks(b, code) {
         const rooks = [];
         for (let sq = 0; sq < 64; sq++) if (b[sq] === code) rooks.push(sq);
@@ -726,7 +748,7 @@ function evaluatePositionForSearch(b, player, moveNumber) {
     score += 20 * countConnectedRooks(b, WR);
     score -= 20 * countConnectedRooks(b, BR);
 
-    // KING SAFETY BONUS (gated on enemy non-pawn material)
+    // KING SAFETY BONUS (gated on enemy non-pawn material AND intact pawn shield)
     const KING_SAFETY_THRESHOLD = 900;
     const KING_SAFETY_BONUS = 45;
 
@@ -735,10 +757,14 @@ function evaluatePositionForSearch(b, player, moveNumber) {
     const bKingRow = bKing >> 3, bKingCol = bKing & 7;
 
     if (bNonPawnMaterial >= KING_SAFETY_THRESHOLD) {
-        if (wKingRow === 7 && wKingCol !== 4) score += KING_SAFETY_BONUS;
+        if (wKingRow === 7 && wKingCol !== 4 && countShieldPawns(b, wKing, true) >= 2) {
+            score += KING_SAFETY_BONUS;
+        }
     }
     if (wNonPawnMaterial >= KING_SAFETY_THRESHOLD) {
-        if (bKingRow === 0 && bKingCol !== 4) score -= KING_SAFETY_BONUS;
+        if (bKingRow === 0 && bKingCol !== 4 && countShieldPawns(b, bKing, false) >= 2) {
+            score -= KING_SAFETY_BONUS;
+        }
     }
 
     // KING DANGER
@@ -820,18 +846,6 @@ function hasNonPawnMaterial(b, player) {
 }
 
 // ============================================================
-// SEE (legacy, unused)
-// ============================================================
-function evaluateCaptureSafety(b, from, to, player) {
-    const victim = b[to];
-    if (victim === 0) return 0;
-    const victimValue = PIECE_VALUE_ARR[victim];
-    const attacker = b[from];
-    const attackerValue = PIECE_VALUE_ARR[attacker];
-    return victimValue - attackerValue;
-}
-
-// ============================================================
 // SEARCH
 // ============================================================
 const SEARCH_CONFIG = {
@@ -840,6 +854,11 @@ const SEARCH_CONFIG = {
     quiescenceDepth: 3,
     hardMaxDepth: 8
 };
+
+// v2.6.8 extension tuning
+const EXTENSION_SCORE_THRESHOLD = 25;   // score swing (points) that triggers extension
+const EXTENSION_SOFT_DEADLINE_MS = 6500; // leave ~1.5s of the 8s budget as buffer
+const EXTENSION_STABLE_LIMIT = 2;        // stop after this many consecutive stable depths
 
 let searchStartTime = 0;
 let searchDeadline = Infinity;
@@ -851,8 +870,6 @@ let avoidRepetition = false;
 let rootEvalWhite = 0;
 const REPETITION_PENALTY = 30;
 
-// Killer moves: two quiet moves per ply that recently caused a beta cutoff.
-// Reset at the start of every findBestMove(). Not persisted, not position-indexed.
 const MAX_PLY = 64;
 let killerMoves = [];
 
@@ -998,7 +1015,6 @@ function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
         if (player === 'black' && nullScore <= alpha) { searchLinePositions.pop(); return alpha; }
     }
 
-    // Killer-move ordering: captures first (MVV-LVA), then killers, then quiet.
     const killers = (ply < MAX_PLY) ? killerMoves[ply] : null;
     moves.sort((a, b1) => orderScore(b, b1, killers) - orderScore(b, a, killers));
 
@@ -1019,7 +1035,6 @@ function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
             continue;
         }
 
-        // LMR fix: check capture status via undo, not the (already moved) board.
         const isQuiet = move.undo.captured === 0;
 
         let reduction = 0;
@@ -1111,7 +1126,6 @@ function findBestMove() {
         }
     }
 
-    // Immediate mate check
     for (const move of allMoves) {
         makeMoveOnBoard(board, move);
         const enemy = enemyColor(currentPlayer);
@@ -1126,7 +1140,6 @@ function findBestMove() {
         unmakeMoveOnBoard(board, move);
     }
 
-    // Opening book — pass UCI history (book is keyed by UCI, not SAN).
     if (openingBook && uciHistory.length < 12) {
         const bookMove = openingBook.getOpeningRecommendation(uciHistory);
         if (bookMove) {
@@ -1151,24 +1164,28 @@ function findBestMove() {
     });
 
     const isEndgame = isEndgamePositionForPosition(board);
-    const maxDepth = isEndgame ? SEARCH_CONFIG.endgameDepth : SEARCH_CONFIG.baseDepth;
+    const baseMaxDepth = isEndgame ? SEARCH_CONFIG.endgameDepth : SEARCH_CONFIG.baseDepth;
+    const absoluteMaxDepth = SEARCH_CONFIG.hardMaxDepth;
 
     let bestMove = candidateMoves[0];
     let bestEval = currentPlayer === 'white' ? -Infinity : Infinity;
     let lastDepth = 0;
 
-    console.log(`🔍 ${currentPlayer.toUpperCase()} searching depth ${maxDepth}`);
+    // Extension-on-instability state
+    let prevScore = null;
+    let prevMoveKey = null;
+    let stableCount = 0;
+    let extended = false;
 
-    for (let depth = 1; depth <= maxDepth; depth++) {
+    console.log(`🔍 ${currentPlayer.toUpperCase()} searching depth ${baseMaxDepth} (ext to ${absoluteMaxDepth})`);
+
+    for (let depth = 1; depth <= absoluteMaxDepth; depth++) {
         if (searchAborted && depth > 1) break;
 
         let iterBestMove = null;
         let iterBestEval = currentPlayer === 'white' ? -Infinity : Infinity;
         const scores = new Map();
 
-        // Root alpha-beta: share alpha/beta across root moves so later
-        // candidates fail low early. Non-best moves log a BOUND, not their
-        // exact value. The best move's score is always exact.
         let rootAlpha = -Infinity;
         let rootBeta = Infinity;
 
@@ -1199,6 +1216,9 @@ function findBestMove() {
         }
 
         if (searchAborted && depth > 1) break;
+
+        const isBaseDepth = depth <= baseMaxDepth;
+
         if (iterBestMove) {
             bestMove = iterBestMove;
             bestEval = iterBestEval;
@@ -1212,10 +1232,36 @@ function findBestMove() {
                 return currentPlayer === 'white' ? sb - sa : sa - sb;
             });
         }
+
+        // Extension-on-instability logic. Only kicks in beyond the base depth.
+        if (!isBaseDepth && iterBestMove) {
+            const newMoveKey = bestMove.from + ',' + bestMove.to;
+            if (prevScore !== null && prevMoveKey !== null) {
+                const delta = Math.abs(bestEval - prevScore);
+                const moveChanged = newMoveKey !== prevMoveKey;
+                if (delta < EXTENSION_SCORE_THRESHOLD && !moveChanged) {
+                    stableCount++;
+                    if (stableCount >= EXTENSION_STABLE_LIMIT) {
+                        console.log(`   ✅ Converged at depth ${depth} (delta ${delta.toFixed(1)}, same move)`);
+                        break;
+                    }
+                } else {
+                    stableCount = 0;
+                }
+            }
+            if (performance.now() - searchStartTime > EXTENSION_SOFT_DEADLINE_MS) {
+                console.log(`   ⏱️ Extension stopped at depth ${depth} (soft deadline)`);
+                break;
+            }
+            extended = true;
+        }
+
+        prevScore = bestEval;
+        prevMoveKey = bestMove ? (bestMove.from + ',' + bestMove.to) : null;
     }
 
     const elapsed = (performance.now() - searchStartTime).toFixed(0);
-    console.log(`⏱️ ${elapsed}ms | ${toSAN(board, bestMove, currentPlayer)} | eval ${bestEval.toFixed(1)} | depth ${lastDepth} | ${nodesSearched} nodes`);
+    console.log(`⏱️ ${elapsed}ms | ${toSAN(board, bestMove, currentPlayer)} | eval ${bestEval.toFixed(1)} | depth ${lastDepth}${extended ? ' (extended)' : ''} | ${nodesSearched} nodes`);
 
     return bestMove;
 }
@@ -1590,4 +1636,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - root alpha-beta, killers, LMR fix, depth 5`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - pawn-shield gate + extension on instability`);
