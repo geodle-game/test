@@ -1,8 +1,8 @@
 // chess-game.js
-// VERSION: 2.7.6 - Fixed horizon-effect blunder (deeper base, stricter convergence)
+// VERSION: 2.7.7 - Speed-ups: flat direction tables, fast boardToHash, Set-based repetition check
 // COMPATIBLE WITH: chess-ai-database.js (v2.0), index.html, chess-game-database.js (v1.1)
 
-const GAME_VERSION = "2.7.6";
+const GAME_VERSION = "2.7.7";
 
 const USE_TT = true;
 const TT_BITS = 18;
@@ -29,6 +29,14 @@ function sqFromRC(row, col) { return row * 8 + col; }
 function sqRow(sq) { return sq >> 3; }
 function sqCol(sq) { return sq & 7; }
 function isInBounds(row, col) { return row >= 0 && row < 8 && col >= 0 && col < 8; }
+
+// ============================================================
+// v2.7.7: Precomputed flat direction tables (dr,dc pairs).
+// Avoids per-call array allocations in the hot path.
+// ============================================================
+const ROOK_DIRS_FLAT   = [-1,0, 1,0, 0,-1, 0,1];
+const BISHOP_DIRS_FLAT = [-1,-1, -1,1, 1,-1, 1,1];
+const QUEEN_DIRS_FLAT  = [-1,0, 1,0, 0,-1, 0,1, -1,-1, -1,1, 1,-1, 1,1];
 
 const KNIGHT_ATTACKS = new Int8Array(64 * 8);
 const KING_ATTACKS = new Int8Array(64 * 8);
@@ -431,7 +439,9 @@ function isSquareAttackedBy(b, sq, byColor) {
     const enemyB = byColor === 'white' ? WB : BB;
     const enemyQ = byColor === 'white' ? WQ : BQ;
 
-    for (const [dr, dc] of [[-1,0],[1,0],[0,-1],[0,1]]) {
+    // v2.7.7: flat direction iteration
+    for (let i = 0; i < ROOK_DIRS_FLAT.length; i += 2) {
+        const dr = ROOK_DIRS_FLAT[i], dc = ROOK_DIRS_FLAT[i+1];
         let nr = r + dr, nc = c + dc;
         while (nr >= 0 && nr < 8 && nc >= 0 && nc < 8) {
             const p = b[sqFromRC(nr, nc)];
@@ -442,7 +452,8 @@ function isSquareAttackedBy(b, sq, byColor) {
             nr += dr; nc += dc;
         }
     }
-    for (const [dr, dc] of [[-1,-1],[-1,1],[1,-1],[1,1]]) {
+    for (let i = 0; i < BISHOP_DIRS_FLAT.length; i += 2) {
+        const dr = BISHOP_DIRS_FLAT[i], dc = BISHOP_DIRS_FLAT[i+1];
         let nr = r + dr, nc = c + dc;
         while (nr >= 0 && nr < 8 && nc >= 0 && nc < 8) {
             const p = b[sqFromRC(nr, nc)];
@@ -671,12 +682,12 @@ function generatePseudoMoves(b, player) {
                 }
             }
         } else {
-            let dirs;
-            if (type === 4) dirs = [[-1,0],[1,0],[0,-1],[0,1]];
-            else if (type === 3) dirs = [[-1,-1],[-1,1],[1,-1],[1,1]];
-            else dirs = [[-1,0],[1,0],[0,-1],[0,1],[-1,-1],[-1,1],[1,-1],[1,1]];
-
-            for (const [dr, dc] of dirs) {
+            // v2.7.7: flat direction iteration for sliders
+            const dirs = type === 4 ? ROOK_DIRS_FLAT
+                       : type === 3 ? BISHOP_DIRS_FLAT
+                       : QUEEN_DIRS_FLAT;
+            for (let i = 0; i < dirs.length; i += 2) {
+                const dr = dirs[i], dc = dirs[i+1];
                 let nr = r + dr, nc = c + dc;
                 while (nr >= 0 && nr < 8 && nc >= 0 && nc < 8) {
                     const to = sqFromRC(nr, nc);
@@ -799,10 +810,16 @@ function checkSuffix(b, move, player) {
 const evalCache = new Map();
 const CACHE_LIMIT = 500000;
 
+// ============================================================
+// v2.7.7: Fast boardToHash using a pre-built char lookup +
+// Array.join('') instead of 64 String.fromCharCode calls.
+// ============================================================
+const HASH_CHARS = new Array(13);
+for (let i = 0; i < 13; i++) HASH_CHARS[i] = String.fromCharCode(48 + i);
+const HASH_BUF = new Array(64);
 function boardToHash(b) {
-    let s = '';
-    for (let i = 0; i < 64; i++) s += String.fromCharCode(48 + b[i]);
-    return s;
+    for (let i = 0; i < 64; i++) HASH_BUF[i] = HASH_CHARS[b[i]];
+    return HASH_BUF.join('');
 }
 
 function cacheGet(cache, key) {
@@ -814,7 +831,7 @@ function cacheSet(cache, key, value) {
     cache.set(key, { value });
 }
 
-function pieceMobility(b, sq, player) {
+function pieceMobility(b, sq) {
     const piece = b[sq];
     if (piece === 0) return 0;
     const type = pieceType(piece);
@@ -832,16 +849,18 @@ function pieceMobility(b, sq, player) {
         }
     } else if (type === 2) {
         const base = sq * 8;
-        for (let i = 0; i < KNIGHT_DEGREE[sq]; i++) {
+        const deg = KNIGHT_DEGREE[sq];
+        for (let i = 0; i < deg; i++) {
             const t = b[KNIGHT_ATTACKS[base + i]];
             if (t === 0 || isWhitePiece(t) !== isWhite) count++;
         }
     } else if (type === 3 || type === 4 || type === 5) {
-        let dirs;
-        if (type === 4) dirs = [[-1,0],[1,0],[0,-1],[0,1]];
-        else if (type === 3) dirs = [[-1,-1],[-1,1],[1,-1],[1,1]];
-        else dirs = [[-1,0],[1,0],[0,-1],[0,1],[-1,-1],[-1,1],[1,-1],[1,1]];
-        for (const [dr, dc] of dirs) {
+        // v2.7.7: flat direction iteration, no per-call array allocation
+        const dirs = type === 4 ? ROOK_DIRS_FLAT
+                   : type === 3 ? BISHOP_DIRS_FLAT
+                   : QUEEN_DIRS_FLAT;
+        for (let i = 0; i < dirs.length; i += 2) {
+            const dr = dirs[i], dc = dirs[i+1];
             let nr = r + dr, nc = c + dc;
             while (nr >= 0 && nr < 8 && nc >= 0 && nc < 8) {
                 const t = b[sqFromRC(nr, nc)];
@@ -852,7 +871,8 @@ function pieceMobility(b, sq, player) {
         }
     } else if (type === 6) {
         const base = sq * 8;
-        for (let i = 0; i < KING_DEGREE[sq]; i++) {
+        const deg = KING_DEGREE[sq];
+        for (let i = 0; i < deg; i++) {
             const t = b[KING_ATTACKS[base + i]];
             if (t === 0 || isWhitePiece(t) !== isWhite) count++;
         }
@@ -922,8 +942,6 @@ function pawnStormDanger(b, kSq, attackerIsWhite) {
     return danger;
 }
 
-// v2.7.4: Is this pawn passed? No enemy pawn on the same or adjacent files
-// ahead of it toward the promotion rank.
 function isPassedPawn(b, sq, isWhite) {
     const r = sq >> 3, c = sq & 7;
     const enemyPawn = isWhite ? BP : WP;
@@ -989,7 +1007,7 @@ function evaluatePositionForSearch(b, player, moveNumber) {
             else bNonPawnMaterial += v;
         }
 
-        const mob = pieceMobility(b, sq, isWhitePiece(p) ? 'white' : 'black');
+        const mob = pieceMobility(b, sq);
         const weight = pt === 2 ? 8 : pt === 3 ? 6 : pt === 4 ? 4 : pt === 5 ? 1 : 1;
         score += (isWhitePiece(p) ? 1 : -1) * mob * weight * 0.5;
 
@@ -1002,13 +1020,11 @@ function evaluatePositionForSearch(b, player, moveNumber) {
 
         if (pt === 1) {
             const pawn = p;
-            // Doubled pawn
             let doubled = false;
             for (let rr = 0; rr < 8; rr++) {
                 if (rr !== r && b[sqFromRC(rr, c)] === pawn) { doubled = true; break; }
             }
             if (doubled) score += isWhite ? -12 : 12;
-            // Isolated pawn
             let isolated = true;
             for (const df of [-1, 1]) {
                 const f = c + df;
@@ -1028,12 +1044,10 @@ function evaluatePositionForSearch(b, player, moveNumber) {
             }
         }
 
-        // Knight outpost
         if (pt === 2) {
             if (isKnightOutpost(b, sq, isWhite)) score += isWhite ? 30 : -30;
         }
 
-        // Rook file openness
         if (pt === 4) {
             const ownPawn = isWhite ? WP : BP;
             const enemyPawn = isWhite ? BP : WP;
@@ -1057,7 +1071,6 @@ function evaluatePositionForSearch(b, player, moveNumber) {
         }
     }
 
-    // Bishop pair
     if (wBishopCount >= 2) score += 25;
     if (bBishopCount >= 2) score -= 25;
 
@@ -1146,11 +1159,6 @@ function evaluatePositionForSearch(b, player, moveNumber) {
     score -= wKingDanger * 0.5;
     score += bKingDanger * 0.5;
 
-    // ============================================================
-    // PAWN ADVANCEMENT (v2.7.5)
-    // Bonuses must ALWAYS leave pawn+bonus < queen (900), otherwise
-    // the search prefers keeping a 7th-rank pawn over promoting it.
-    // ============================================================
     for (let sq = 0; sq < 64; sq++) {
         const p = b[sq];
         if (p === WP) {
@@ -1158,7 +1166,7 @@ function evaluatePositionForSearch(b, player, moveNumber) {
             const passed = isPassedPawn(b, sq, true);
             if (r === 1) {
                 score += 400;
-                if (passed) score += 150;   // pawn + bonus ≤ 650 < queen
+                if (passed) score += 150;
             } else if (r === 2) {
                 score += 150;
                 if (passed) score += 50;
@@ -1180,11 +1188,6 @@ function evaluatePositionForSearch(b, player, moveNumber) {
         }
     }
 
-    // ============================================================
-    // K+P vs K endgame knowledge (v2.7.5)
-    // Reward:  king in front of the pawn, escorting it.
-    // Penalize: king stuck in the corner in front of its own pawn (draw).
-    // ============================================================
     if (pieceCount <= 3) {
         for (let sq = 0; sq < 64; sq++) {
             const p = b[sq];
@@ -1207,10 +1210,6 @@ function evaluatePositionForSearch(b, player, moveNumber) {
         score += ((7 - (wKing >> 3)) + (wKing & 7)) * 3;
         score -= ((bKing >> 3) + (7 - (bKing & 7))) * 3;
 
-        // ============================================================
-        // v2.7.5: Only "drive the enemy king to the edge" when we have
-        // an actual mating force on the board (R/Q or 2+ minors ahead).
-        // ============================================================
         const wEdgeDist = Math.min(wKingRow, 7 - wKingRow, wKingCol, 7 - wKingCol);
         const bEdgeDist = Math.min(bKingRow, 7 - bKingRow, bKingCol, 7 - bKingCol);
 
@@ -1251,11 +1250,6 @@ function hasNonPawnMaterial(b, player) {
     return false;
 }
 
-// ============================================================
-// v2.7.6: Deeper base depth so 4-ply-deep tactical traps are
-// visible before the extension loop bails out. Stricter
-// convergence (2 stable iterations) prevents premature stop.
-// ============================================================
 const SEARCH_CONFIG = {
     baseDepth: 5,
     endgameDepth: 7,
@@ -1272,7 +1266,8 @@ let searchDeadline = Infinity;
 let searchAborted = false;
 let nodesSearched = 0;
 
-let searchLinePositions = [];
+// v2.7.7: Set-based repetition detection (O(1) has/add/delete)
+let searchLineSet = new Set();
 let avoidRepetition = false;
 let rootEvalWhite = 0;
 const REPETITION_PENALTY = 30;
@@ -1399,17 +1394,17 @@ function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
     }
 
     const posKey = boardToHash(b) + player[0];
-    if (ply > 0 && searchLinePositions.includes(posKey)) {
+    if (ply > 0 && searchLineSet.has(posKey)) {
         return avoidRepetition ? (rootEvalWhite > 0 ? -REPETITION_PENALTY : REPETITION_PENALTY) : 0;
     }
-    searchLinePositions.push(posKey);
+    searchLineSet.add(posKey);
 
     const enemy = enemyColor(player);
     const inCheck = isSquareAttackedBy(b, kingSq[player], enemy);
 
     const moves = getAllPossibleMovesForPosition(b, player);
     if (moves.length === 0) {
-        searchLinePositions.pop();
+        searchLineSet.delete(posKey);
         if (inCheck) {
             return player === 'white' ? (-20000 + ply) : (20000 - ply);
         }
@@ -1417,7 +1412,7 @@ function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
     }
 
     if (depth <= 0 && !inCheck) {
-        searchLinePositions.pop();
+        searchLineSet.delete(posKey);
         return quiescenceSearch(b, alpha, beta, player, SEARCH_CONFIG.quiescenceDepth);
     }
 
@@ -1426,7 +1421,7 @@ function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
             depth = 1;
             checkExt++;
         } else {
-            searchLinePositions.pop();
+            searchLineSet.delete(posKey);
             return quiescenceSearch(b, alpha, beta, player, SEARCH_CONFIG.quiescenceDepth);
         }
     }
@@ -1438,8 +1433,8 @@ function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
         const R = 2;
         const nullScore = minimax(b, depth - 1 - R, alpha, beta, enemy, ply + 1, checkExt, false);
         enPassantTarget = savedEp;
-        if (player === 'white' && nullScore >= beta) { searchLinePositions.pop(); return beta; }
-        if (player === 'black' && nullScore <= alpha) { searchLinePositions.pop(); return alpha; }
+        if (player === 'white' && nullScore >= beta) { searchLineSet.delete(posKey); return beta; }
+        if (player === 'black' && nullScore <= alpha) { searchLineSet.delete(posKey); return alpha; }
     }
 
     const killers = (ply < MAX_PLY) ? killerMoves[ply] : null;
@@ -1513,7 +1508,7 @@ function minimax(b, depth, alpha, beta, player, ply, checkExt, allowNull) {
         }
     }
 
-    searchLinePositions.pop();
+    searchLineSet.delete(posKey);
 
     if (!anyMoveSearched) return standPat;
     const finalBest = isFinite(best) ? best : 0;
@@ -1544,7 +1539,7 @@ function findBestMove() {
 
     searchAborted = false;
     nodesSearched = 0;
-    searchLinePositions = [];
+    searchLineSet = new Set();
     resetKillerMoves();
     if (USE_TT) ttClear();
 
@@ -1552,9 +1547,9 @@ function findBestMove() {
     avoidRepetition = Math.abs(rootEvalWhite) > 150;
 
     for (const state of gameHistory) {
-        searchLinePositions.push(boardToHash(state.boardCopy) + state.currentPlayerCopy[0]);
+        searchLineSet.add(boardToHash(state.boardCopy) + state.currentPlayerCopy[0]);
     }
-    searchLinePositions.push(boardToHash(board) + currentPlayer[0]);
+    searchLineSet.add(boardToHash(board) + currentPlayer[0]);
 
     const allMoves = getAllPossibleMovesForPosition(board, currentPlayer);
     if (allMoves.length === 0) return null;
@@ -1612,9 +1607,6 @@ function findBestMove() {
         }
     }
 
-    // ============================================================
-    // v2.7.5: Promotion-first move ordering at the root.
-    // ============================================================
     candidateMoves.sort((a, b1) => {
         const aQueen = a.promo === 5 ? 1 : 0;
         const bQueen = b1.promo === 5 ? 1 : 0;
@@ -2134,4 +2126,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - deeper base, stricter convergence`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - flat tables, fast hash, Set repetition check`);
