@@ -1,8 +1,8 @@
 // chess-game.js
-// VERSION: 2.7.7 - Speed-ups: flat direction tables, fast boardToHash, Set-based repetition check
+// VERSION: 2.7.8 - Opening development penalty (curbs flank-pawn madness)
 // COMPATIBLE WITH: chess-ai-database.js (v2.0), index.html, chess-game-database.js (v1.1)
 
-const GAME_VERSION = "2.7.7";
+const GAME_VERSION = "2.7.8";
 
 const USE_TT = true;
 const TT_BITS = 18;
@@ -32,7 +32,6 @@ function isInBounds(row, col) { return row >= 0 && row < 8 && col >= 0 && col < 
 
 // ============================================================
 // v2.7.7: Precomputed flat direction tables (dr,dc pairs).
-// Avoids per-call array allocations in the hot path.
 // ============================================================
 const ROOK_DIRS_FLAT   = [-1,0, 1,0, 0,-1, 0,1];
 const BISHOP_DIRS_FLAT = [-1,-1, -1,1, 1,-1, 1,1];
@@ -439,7 +438,6 @@ function isSquareAttackedBy(b, sq, byColor) {
     const enemyB = byColor === 'white' ? WB : BB;
     const enemyQ = byColor === 'white' ? WQ : BQ;
 
-    // v2.7.7: flat direction iteration
     for (let i = 0; i < ROOK_DIRS_FLAT.length; i += 2) {
         const dr = ROOK_DIRS_FLAT[i], dc = ROOK_DIRS_FLAT[i+1];
         let nr = r + dr, nc = c + dc;
@@ -682,7 +680,6 @@ function generatePseudoMoves(b, player) {
                 }
             }
         } else {
-            // v2.7.7: flat direction iteration for sliders
             const dirs = type === 4 ? ROOK_DIRS_FLAT
                        : type === 3 ? BISHOP_DIRS_FLAT
                        : QUEEN_DIRS_FLAT;
@@ -810,10 +807,6 @@ function checkSuffix(b, move, player) {
 const evalCache = new Map();
 const CACHE_LIMIT = 500000;
 
-// ============================================================
-// v2.7.7: Fast boardToHash using a pre-built char lookup +
-// Array.join('') instead of 64 String.fromCharCode calls.
-// ============================================================
 const HASH_CHARS = new Array(13);
 for (let i = 0; i < 13; i++) HASH_CHARS[i] = String.fromCharCode(48 + i);
 const HASH_BUF = new Array(64);
@@ -855,7 +848,6 @@ function pieceMobility(b, sq) {
             if (t === 0 || isWhitePiece(t) !== isWhite) count++;
         }
     } else if (type === 3 || type === 4 || type === 5) {
-        // v2.7.7: flat direction iteration, no per-call array allocation
         const dirs = type === 4 ? ROOK_DIRS_FLAT
                    : type === 3 ? BISHOP_DIRS_FLAT
                    : QUEEN_DIRS_FLAT;
@@ -1159,6 +1151,56 @@ function evaluatePositionForSearch(b, player, moveNumber) {
     score -= wKingDanger * 0.5;
     score += bKingDanger * 0.5;
 
+    // ============================================================
+    // OPENING DEVELOPMENT (v2.7.8)
+    // Fades from full strength at move 1 to zero at move 16.
+    // Fixes: AI plays flank pawn pushes instead of developing.
+    // ============================================================
+    if (moveNumber <= 16) {
+        const fade = Math.max(0, (16 - moveNumber) / 15);
+
+        // (a) Reward developed minors (pieces off their home rank)
+        let wDev = 0, bDev = 0;
+        for (let sq = 0; sq < 64; sq++) {
+            const p = b[sq];
+            if (p === 0) continue;
+            const pt = pieceType(p);
+            if (pt !== 2 && pt !== 3) continue;
+            const backRank = isWhitePiece(p) ? 7 : 0;
+            if ((sq >> 3) !== backRank) {
+                if (isWhitePiece(p)) wDev++;
+                else bDev++;
+            }
+        }
+        score += (wDev - bDev) * 40 * fade;
+
+        // (b) Extra penalty for undeveloped minors
+        //     (stacks on the existing -25/-15 back-rank term)
+        score -= wUndevelopedMinors * 30 * fade;
+        score += bUndevelopedMinors * 30 * fade;
+
+        // (c) Penalize own flank pawn advances past the 4th rank before
+        //     development is complete — weakens king, wastes tempos.
+        for (let sq = 0; sq < 64; sq++) {
+            const p = b[sq];
+            if (p === 0) continue;
+            const r = sq >> 3, c = sq & 7;
+            const isFlank = (c <= 1 || c >= 6);   // a, b, g, h files
+            if (!isFlank) continue;
+            if (p === WP && r <= 4) score -= 18 * fade;
+            else if (p === BP && r >= 3) score += 18 * fade;
+        }
+
+        // (d) Castling / uncastled-king penalty
+        if (wKing === 62 || wKing === 58) score += 50 * fade;   // castled
+        else if (wKingRow === 7)          score -= 20 * fade;   // still home
+        if (bKing === 6  || bKing === 2 ) score -= 50 * fade;
+        else if (bKingRow === 0)          score += 20 * fade;
+    }
+
+    // ============================================================
+    // PAWN ADVANCEMENT (v2.7.5)
+    // ============================================================
     for (let sq = 0; sq < 64; sq++) {
         const p = b[sq];
         if (p === WP) {
@@ -1266,7 +1308,6 @@ let searchDeadline = Infinity;
 let searchAborted = false;
 let nodesSearched = 0;
 
-// v2.7.7: Set-based repetition detection (O(1) has/add/delete)
 let searchLineSet = new Set();
 let avoidRepetition = false;
 let rootEvalWhite = 0;
@@ -2126,4 +2167,4 @@ if (typeof window !== 'undefined') {
     window.clearAIMemory = clearMemory;
 }
 
-console.log(`✅ Chess Game v${GAME_VERSION} loaded - flat tables, fast hash, Set repetition check`);
+console.log(`✅ Chess Game v${GAME_VERSION} loaded - opening development fix active`);
